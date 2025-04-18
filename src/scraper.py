@@ -26,16 +26,34 @@ class WaterBillScraper:
         
         Args:
             service_address: The address to look up
-            
+                
         Returns:
             Dictionary with bill details or error information
         """
         try:
-            # Step 1: Get the account number for this address
+            # Try with the original address first
             account_result = self.get_account_number_for_address(service_address)
             
+            # If the first attempt failed, try with just the street number and name
             if not account_result.get("success"):
-                return account_result
+                # Parse address to get just the number and street name
+                address_parts = service_address.split()
+                
+                if len(address_parts) >= 2:
+                    # Handle leading zeros in the address number
+                    if address_parts[0].startswith('0'):
+                        address_parts[0] = address_parts[0].lstrip('0')
+                    
+                    # Just use the first two parts (number and street name)
+                    simplified_address = f"{address_parts[0]} {address_parts[1]}"
+                    logger.info(f"Trying simplified address: {simplified_address}")
+                    account_result = self.get_account_number_for_address(simplified_address)
+            
+            if not account_result.get("success"):
+                return {
+                    "success": False,
+                    "message": f"No account found for address: {service_address}"
+                }
             
             account_number = account_result.get("account_number")
             
@@ -47,7 +65,7 @@ class WaterBillScraper:
             
             # Step 2: Get bill details using the account number
             return self.get_bill_details_by_account_number(account_number)
-            
+                
         except Exception as e:
             logger.error(f"Error getting water bill details: {e}")
             return {

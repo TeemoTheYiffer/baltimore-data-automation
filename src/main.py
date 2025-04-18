@@ -4,12 +4,17 @@ import argparse
 from typing import Optional
 import random
 import ssl
+import requests
 from config import Settings
 from scraper import WaterBillScraper
 from sheets import SheetsManager
 import concurrent.futures
 from functools import partial
 import time
+from config import MarylandPropertySettings
+from property_api import PropertyDataAPI
+from googleapiclient.errors import HttpError
+import random
 
 # Setup logging
 logging.basicConfig(
@@ -17,18 +22,17 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('baltimore_water.log')
+        logging.FileHandler('baltimore.log')
     ]
 )
 
-logger = logging.getLogger("baltimore_water")
+logger = logging.getLogger("baltimore")
 
 def process_addresses_for_bill_details(
     settings: Optional[Settings] = None,
-    sheet_name: str = "Sheet1",
+    sheets_manager: Optional[SheetsManager] = None,
+    sheet_name: str = "Water Bill",
     delay_seconds: float = None,
-    batch_size: int = 100,
-    max_workers: int = 5 
 ) -> None:
     """
     Process addresses using parallel scraping and batched sheet updates.
@@ -37,15 +41,19 @@ def process_addresses_for_bill_details(
         settings: Application settings
         sheet_name: Name of the sheet to use
         delay_seconds: Delay between requests to override settings
-        batch_size: Number of addresses to process in each batch
-        max_workers: Maximum number of worker threads
     """
     settings = settings or Settings()
     
     logger.info(f"Starting water bill processing for sheet: {sheet_name}")
+    logger.info(f"Processing rows from {settings.START_ROW} to " + 
+                (f"{settings.STOP_ROW}" if settings.STOP_ROW > 0 else 
+                f"{settings.START_ROW + settings.MAX_ROWS - 1}"))
     
-    # Set up sheets manager and headers
-    sheets = SheetsManager(settings)
+    if settings.SKIP_ROW_RANGE:
+        logger.info(f"Skipping rows: {settings.SKIP_ROW_RANGE}")
+    
+    # Use the provided sheets_manager or create a new one
+    sheets = sheets_manager or SheetsManager(settings)
     try:
         sheets.setup_headers(sheet_name)
         addresses = sheets.get_addresses(sheet_name)
@@ -57,7 +65,10 @@ def process_addresses_for_bill_details(
         logger.warning(f"No addresses found in sheet: {sheet_name}")
         return
     
-    logger.info(f"Processing {len(addresses)} addresses using {max_workers} threads with batch updates of {batch_size}")
+    logger.info(f"Processing {len(addresses)} addresses using {settings.MAX_WORKERS} threads with batch updates of {settings.BATCH_SIZE} rows")
+    
+    # Initialize results variable before any reference to it
+    results = []
     
     # Scraper worker function
     def scrape_address(args):
@@ -76,25 +87,12 @@ def process_addresses_for_bill_details(
     # Start timing
     start_time = time.time()
     
-    # Update all rows to "Processing..."
-    status_updates = [(i, {"success": False, "message": "Processing..."}) 
-                      for i, addr in enumerate(addresses) if addr]
-    
-    # Update statuses in batches
-    for i in range(0, len(status_updates), batch_size):
-        batch = status_updates[i:i+batch_size]
-        try:
-            sheets.batch_update_bill_details(batch, sheet_name)
-        except Exception as e:
-            logger.error(f"Failed to update processing status batch: {e}")
-    
     # Process addresses in parallel
-    results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all jobs
+    with concurrent.futures.ThreadPoolExecutor(max_workers=settings.MAX_WORKERS) as executor:
+        # Submit all jobs - note that addresses now contains tuples of (index, address)
         future_to_idx = {
-            executor.submit(scrape_address, (i, addr)): i 
-            for i, addr in enumerate(addresses) if addr
+            executor.submit(scrape_address, (idx, addr)): idx 
+            for idx, addr in addresses
         }
         
         # Process results as they complete
@@ -110,25 +108,47 @@ def process_addresses_for_bill_details(
     results.sort(key=lambda x: x[0])
     
     # Update the sheet in batches
-    for i in range(0, len(results), batch_size):
-        batch = results[i:i+batch_size]
+    for i in range(0, len(results), settings.BATCH_SIZE):
+        batch = results[i:i+settings.BATCH_SIZE]
         try:
             sheets.batch_update_bill_details(batch, sheet_name)
-            logger.info(f"Updated batch {i//batch_size + 1} of {(len(results) + batch_size - 1)//batch_size}")
-        except Exception as e:
-            logger.error(f"Failed to update results batch: {e}")
-            # Attempt individual updates as fallback
-            for idx, result in batch:
+            logger.info(f"Updated batch {i//settings.BATCH_SIZE + 1} of {(len(results) + settings.BATCH_SIZE - 1)//settings.BATCH_SIZE}")
+            
+            # Add delay between batches to avoid hitting API limits
+            if i + settings.BATCH_SIZE < len(results):  # Don't delay after the last batch
+                logger.info(f"Sleeping for {settings.DELAY_BETWEEN_BATCHES} seconds before next batch")
+                time.sleep(settings.DELAY_BETWEEN_BATCHES)
+        except HttpError as e:
+            if e.resp.status == 429:  # Rate limit error
+                logger.warning("Rate limit exceeded on batch. Waiting 60 seconds for quota reset...")
+                time.sleep(60)  # Wait a full minute for quota reset
                 try:
-                    sheets.update_row_with_bill_details(idx, result, sheet_name)
-                except Exception as inner_e:
-                    logger.error(f"Failed to update row {idx+2}: {inner_e}")
+                    sheets.batch_update_bill_details(batch, sheet_name)
+                except Exception as retry_e:
+                    logger.error(f"Retry after quota reset failed: {retry_e}")
+                    # Only fall back to individual updates as last resort
+                    for idx, result in batch:
+                        try:
+                            time.sleep(1)  # Add delay between individual requests
+                            sheets.update_row_with_bill_details(idx, result, sheet_name)
+                        except Exception as inner_e:
+                            logger.error(f"Failed to update row {idx+2}: {inner_e}")
+            else:
+                logger.error(f"Failed to update results batch: {e}")
+                # Attempt individual updates as fallback for non-rate-limit errors
+                for idx, result in batch:
+                    try:
+                        time.sleep(1)  # Add delay between individual requests
+                        sheets.update_row_with_bill_details(idx, result, sheet_name)
+                    except Exception as inner_e:
+                        logger.error(f"Failed to update row {idx+2}: {inner_e}")
     
     # Calculate and log timing information
     total_time = time.time() - start_time
     logger.info(f"Water bill processing completed for sheet: {sheet_name}")
     logger.info(f"Total processing time: {total_time:.2f} seconds for {len(addresses)} addresses")
     logger.info(f"Average time per address: {total_time/len(addresses):.2f} seconds")
+
 def list_sheets():
     """List all sheets in the spreadsheet."""
     settings = Settings()
@@ -144,92 +164,153 @@ def list_sheets():
         logger.error(f"Failed to list sheets: {e}")
         print(f"Error: {e}")
 
-def process_address_worker(args):
-    """Standalone worker function that creates its own connections"""
-    address, index, sheet_name, spreadsheet_id = args
+def process_addresses_for_property_data(
+    settings: Optional[Settings] = None,
+    property_settings: Optional[MarylandPropertySettings] = None,
+    sheets_manager: Optional[SheetsManager] = None,
+    sheet_name: str = "LIENS",
+    delay_seconds: float = None,
+) -> None:
+    """
+    Process addresses to get Maryland property data.
     
-    # Setup independent logging for this process
-    process_logger = logging.getLogger(f"baltimore_water.worker.{index}")
+    Args:
+        settings: Application settings
+        property_settings: Maryland Property API settings
+        sheets_manager: Existing SheetsManager instance to reuse (optional)
+        sheet_name: Name of the sheet to use
+        delay_seconds: Delay between requests to override settings
+    """
+    settings = settings or Settings()
+    property_settings = property_settings or MarylandPropertySettings()
     
-    if not address:
-        return
+    logger.info(f"Starting property data processing for sheet: {sheet_name}")
     
-    process_logger.info(f"Processing address {index+1}: {address}")
+    # Pass BOTH settings objects to SheetsManager
+    sheets = sheets_manager or SheetsManager(settings, property_settings)
+    logger.info(f"Processing rows from {settings.START_ROW} to " + 
+                (f"{settings.STOP_ROW}" if settings.STOP_ROW > 0 else 
+                f"{settings.START_ROW + settings.MAX_ROWS - 1}"))
     
-    # Create fresh instances for each worker process
-    settings = Settings()
-    scraper = WaterBillScraper(settings)
-    sheets = SheetsManager(settings)
+    if settings.SKIP_ROW_RANGE:
+        logger.info(f"Skipping rows: {settings.SKIP_ROW_RANGE}")
     
     try:
-        # Update status
-        sheets.update_status(index, "Processing...", sheet_name)
-        
-        # Get water bill details
-        result = scraper.get_water_bill_details(address)
-        
-        # Update the spreadsheet
-        sheets.update_row_with_bill_details(index, result, sheet_name)
-        
-        return True
+        # Get addresses with their row indices
+        address_data = sheets.get_property_addresses(sheet_name)
     except Exception as e:
-        process_logger.error(f"Error processing address {address}: {e}")
-        
-        # Try updating status, but don't fail if it doesn't work
-        try:
-            sheets.update_status(index, f"Error: {str(e)[:50]}", sheet_name)
-        except:
-            pass
-        
-        return False
-
-def process_single_address(address, index, scraper, sheets, sheet_name):
-    """Process a single address with the scraper and update sheets."""
-    if not address:
+        logger.error(f"Failed to get addresses from sheet {sheet_name}: {e}")
         return
-        
-    logger.info(f"Processing address {index+1}: {address}")
     
-    # Update status to "Processing"
-    for retry in range(3):  # Add retries for SSL errors
+    if not address_data:
+        logger.warning(f"No addresses found in sheet: {sheet_name}")
+        return
+    
+    logger.info(f"Processing {len(address_data)} addresses using {settings.MAX_WORKERS} threads with batch updates of {settings.BATCH_SIZE} rows")
+    
+    # Initialize the property API client
+    property_api = PropertyDataAPI(settings, property_settings)
+    results = []
+    
+    # Start timing
+    start_time = time.time()
+    
+    # Define robust process_address function with built-in retries
+    def process_address(row_idx, address):
+        if not address:
+            return row_idx, None
+        
         try:
-            sheets.update_status(index, "Processing...", sheet_name)
-            break
-        except ssl.SSLError as e:
-            logger.warning(f"SSL error updating status (retry {retry+1}/3): {e}")
-            time.sleep(1 + random.random())  # Add delay with jitter
-            if retry == 2:  # Last retry
-                logger.error(f"Failed to update status for {address} after 3 retries")
-    
-    try:
-        # Get water bill details
-        result = scraper.get_water_bill_details(address)
-        
-        # Update with retries for SSL errors
-        for retry in range(3):
-            try:
-                sheets.update_row_with_bill_details(index, result, sheet_name)
-                break
-            except ssl.SSLError as e:
-                logger.warning(f"SSL error updating row (retry {retry+1}/3): {e}")
-                time.sleep(1 + random.random())
-                if retry == 2:
-                    raise
+            # Get property data
+            result = property_api.get_property_data(address)
+            
+            # Add delay between requests
+            delay = delay_seconds if delay_seconds is not None else property_settings.REQUEST_DELAY
+            time.sleep(delay)
+            
+            return row_idx, result
+            
+        except Exception as e:
+            # Try to log error without including the exception details
+            logger.error(f"Error processing address (row {row_idx+2})")
+            
+            # Create error result without logging the actual exception
+            error_result = {"success": False, "message": "Error processing address"}
                 
-    except Exception as e:
-        logger.error(f"Error processing address {address}: {e}")
+            return row_idx, error_result
+    
+    # Process addresses in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=settings.MAX_WORKERS) as executor:
+        # Submit all jobs
+        future_to_idx = {
+            executor.submit(process_address, idx, addr): idx 
+            for idx, addr in address_data if addr
+        }
+        
+        # Process results as they complete
+        for future in concurrent.futures.as_completed(future_to_idx):
+            try:
+                idx, result = future.result()
+                if result:  # Skip None results (empty addresses)
+                    results.append((idx, result))
+            except Exception as e:
+                logger.error(f"Worker thread error: {e}")
+    
+    # Sort results by index to maintain order
+    results.sort(key=lambda x: x[0])
+    
+    # Update the sheet in batches
+    for i in range(0, len(results), property_settings.BATCH_SIZE):
+        batch = results[i:i+property_settings.BATCH_SIZE]
         try:
-            sheets.update_status(index, f"Error: {str(e)}", sheet_name)
-        except:
-            logger.error(f"Failed to update error status for {address}")
+            sheets.batch_update_property_data(batch, sheet_name)
+            logger.info(f"Updated batch {i//property_settings.BATCH_SIZE + 1} of {(len(results) + property_settings.BATCH_SIZE - 1)//property_settings.BATCH_SIZE}")
+            
+            # Add substantial delay between batches to avoid hitting API limits
+            if i + property_settings.BATCH_SIZE < len(results):  # Don't delay after the last batch
+                delay_time = property_settings.DELAY_BETWEEN_BATCHES
+                logger.info(f"Sleeping for {delay_time} seconds before next batch")
+                time.sleep(delay_time)
+        except HttpError as e:
+            if e.resp.status == 429:  # Rate limit error
+                logger.warning("Rate limit exceeded on batch. Waiting 60 seconds for quota reset...")
+                time.sleep(60)  # Wait a full minute for quota reset
+                try:
+                    sheets.batch_update_property_data(batch, sheet_name)
+                except Exception as retry_e:
+                    logger.error(f"Retry failed: {retry_e}")
+            else:
+                logger.error(f"Failed to update results batch: {e}")
+                # Only attempt individual updates for non-rate-limit errors
+                if "RATE_LIMIT_EXCEEDED" not in str(e):
+                    logger.warning("Falling back to individual updates")
+                    for idx, result in batch:
+                        try:
+                            time.sleep(1)  # Add delay between individual requests
+                            sheets.update_row_with_property_data(idx, result, sheet_name)
+                        except Exception as inner_e:
+                            logger.error(f"Failed to update row {idx+2}: {inner_e}")
+    
+    # Calculate and log timing information
+    total_time = time.time() - start_time
+    logger.info(f"Property data processing completed for sheet: {sheet_name}")
+    logger.info(f"Total processing time: {total_time:.2f} seconds for {len(address_data)} addresses")
+    logger.info(f"Average time per address: {total_time/len(address_data):.2f} seconds")
 
 def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser(description="Baltimore Water Bill Scraper")
+    parser = argparse.ArgumentParser(description="Baltimore Data Processing")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["water", "property", "both"],
+        default="water",
+        help="Processing mode: water bill, property data, or both"
+    )
     parser.add_argument(
         "--sheet", 
         type=str, 
-        help="Name of the sheet to use (omit to process all sheets)"
+        help="Name of the sheet to use (defaults to value in config)"
     )
     parser.add_argument(
         "--list-sheets",
@@ -240,6 +321,26 @@ def main():
         "--delay", 
         type=float, 
         help="Delay between requests in seconds (overrides config)"
+    )
+    parser.add_argument(
+        "--start-row",
+        type=int,
+        help="Starting row for processing (1-indexed, overrides config)"
+    )
+    parser.add_argument(
+        "--stop-row",
+        type=int,
+        help="Ending row for processing (1-indexed, overrides config)"
+    )
+    parser.add_argument(
+        "--max-rows",
+        type=int,
+        help="Maximum number of rows to process (overrides config)"
+    )
+    parser.add_argument(
+        "--skip-rows",
+        type=str,
+        help="Comma-separated list of rows or ranges to skip (e.g. '5,8,10-15') (overrides config)"
     )
     parser.add_argument(
         "--address", 
@@ -255,9 +356,23 @@ def main():
     args = parser.parse_args()
     
     settings = Settings()
+    property_settings = MarylandPropertySettings()
+    
+    # Apply command line overrides to settings
+    if args.start_row:
+        settings.START_ROW = args.start_row
+        property_settings.START_ROW = args.start_row
+    if args.stop_row:
+        settings.STOP_ROW = args.stop_row
+        property_settings.STOP_ROW = args.stop_row  
+    if args.max_rows:
+        settings.MAX_ROWS = args.max_rows
+        property_settings.MAX_ROWS = args.max_rows
+    if args.skip_rows:
+        settings.SKIP_ROW_RANGE = args.skip_rows
+        property_settings.SKIP_ROW_RANGE = args.skip_rows
     
     if args.list_sheets:
-        # List all available sheets
         list_sheets()
         return
         
@@ -277,47 +392,28 @@ def main():
         print(result)
         return
     
-    # Initialize sheets manager
-    sheets_manager = SheetsManager(settings)
-    
-    # Get sheets to process
-    sheets_to_process = []
-    
-    if args.sheet:
-        # Process a specific sheet - check if it exists
-        if sheets_manager.sheet_exists(args.sheet):
-            sheets_to_process = [args.sheet]
-        else:
-            logger.error(f"Sheet '{args.sheet}' not found in the spreadsheet")
-            print(f"Error: Sheet '{args.sheet}' not found. Use --list-sheets to see available sheets.")
-            return
-    else:
-        # Process all sheets that have addresses
-        try:
-            sheets_to_process = sheets_manager.get_all_sheet_names()
-            logger.info(f"Found {len(sheets_to_process)} sheets to process")
-        except Exception as e:
-            logger.error(f"Failed to get sheet names: {e}")
-            return
-    
-    if not sheets_to_process:
-        logger.error("No sheets to process")
-        return
-    
-    # Process each sheet
-    for sheet_name in sheets_to_process:
-        logger.info(f"Processing sheet: {sheet_name}")
-        
-        try:
-            # Process all addresses in the spreadsheet
+    sheets_manager = SheetsManager(settings, property_settings)
+
+    if args.mode in ["water", "both"]:
+        water_sheet_name = args.sheet if args.sheet else settings.SHEET_NAME
+        if sheets_manager.sheet_exists(water_sheet_name):
             process_addresses_for_bill_details(
                 settings=settings,
-                sheet_name=sheet_name,
+                sheets_manager=sheets_manager,
+                sheet_name=water_sheet_name,
                 delay_seconds=args.delay
             )
-        except Exception as e:
-            logger.error(f"Error processing sheet {sheet_name}: {e}")
-            continue
+    
+    if args.mode in ["property", "both"]:
+        property_sheet_name = args.sheet if args.sheet else property_settings.PROPERTY_SHEET_NAME
+        if sheets_manager.sheet_exists(property_sheet_name):
+            process_addresses_for_property_data(
+                settings=settings,
+                property_settings=property_settings,
+                sheets_manager=sheets_manager,
+                sheet_name=property_sheet_name,
+                delay_seconds=args.delay
+            )
 
 if __name__ == "__main__":
     main()

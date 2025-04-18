@@ -1,17 +1,31 @@
-# Baltimore Water Bill Scraper
+# Baltimore Data Automation
 
-A Python application for scraping water bill information from the Baltimore City water bill website and updating a Google Spreadsheet.
+A Python application for scraping water bill information from the Baltimore City water bill website and retrieving Maryland property data, then updating a Google Spreadsheet with the information.
 
 ## Features
 
+### Water Bill Scraping
 - Scrapes water bill details from the Baltimore City water bill website (https://pay.baltimorecity.gov/water/)
 - Handles authentication via request verification tokens
 - Processes address lookups to retrieve account numbers
 - Retrieves detailed water bill information using account numbers
 - Updates a Google Spreadsheet with the retrieved information
+
+### Maryland Property Data
+- Retrieves property data from the Maryland property database
+- Maps property fields like block/lot numbers, sale dates, property dimensions, and assessed values
+- Creates automatic links to map locations and property records
+- Identifies vacant lots based on improvement values
+- Processes address information to generate standardized hundred-block values
+
+### Common Features
 - Supports batch processing of multiple addresses
-- Provides logging and error handling
-- Includes options for testing single addresses or account numbers
+- Multi-threaded processing for improved performance
+- Robust error handling and automatic retries
+- Batch updates to Google Sheets to reduce API calls
+- Detailed logging for troubleshooting
+- Configurable processing with command-line options
+- Options for testing single addresses or account numbers
 
 ## Prerequisites
 
@@ -42,7 +56,7 @@ A Python application for scraping water bill information from the Baltimore City
    ```python
    # secrets/google_credentials.py
    SERVICE_ACCOUNT_FILE = "secrets/service_account.json"
-   IMPERSONATED_USER = "your-user@domain.com"  # Replace with your actual email
+   IMPERSONATED_USER = "your-user@mountwilsoncapital.com"  # Replace with your actual email
    ```
 
 5. Place your service account JSON file in the secrets directory:
@@ -62,18 +76,24 @@ If you encounter issues with credentials:
 
 You can run the script with the `--list-sheets` option to test if your credentials are working properly:
 ```
-python main.py --list-sheets
+python src/main.py --list-sheets
 ```
 
-If you still have issues, check the log file `baltimore_water.log` for more detailed error messages.
+If you still have issues, check the log file `baltimore.log` for more detailed error messages.
 
 ## Usage
 
 ### Preparing Your Spreadsheet
 
-1. Create a Google Spreadsheet with the following structure:
+#### Water Bill Spreadsheet
+1. Create a sheet with the following structure:
    - Column A: Service addresses to look up
-   - Columns B-I will be populated with the results
+   - Columns B-I will be populated with the results (account number, bill date, amounts, etc.)
+
+#### Property Data Spreadsheet
+1. Create a sheet named "LIENS" (or customize the name in settings)
+   - Column A: Property addresses to look up
+   - Other columns will be populated with property data (block, lot, sale dates, etc.)
 
 2. Share the spreadsheet with your service account email address
 
@@ -84,25 +104,45 @@ If you still have issues, check the log file `baltimore_water.log` for more deta
 To list all available sheets in the spreadsheet:
 
 ```
-python main.py --list-sheets
+python src/main.py --list-sheets
 ```
 
-To process all sheets automatically:
+To process water bill data only:
 
 ```
-python main.py
+python src/main.py --mode water
+```
+
+To process property data only:
+
+```
+python src/main.py --mode property
+```
+
+To process both water bill and property data:
+
+```
+python src/main.py --mode both
 ```
 
 To process a specific sheet:
 
 ```
-python main.py --sheet "Sheet2"
+python src/main.py --mode water --sheet "MyWaterBillSheet"
 ```
 
 To change the delay between requests:
 
 ```
-python main.py --delay 5.0
+python src/main.py --delay 5.0
+```
+
+### Additional Command-Line Options
+
+```
+python src/main.py --start-row 10 --stop-row 50  # Process only rows 10-50
+python src/main.py --max-rows 100  # Process at most 100 rows
+python src/main.py --skip-rows "5,8,10-15"  # Skip specific rows or ranges
 ```
 
 ### Testing
@@ -110,35 +150,38 @@ python main.py --delay 5.0
 To test with a single address:
 
 ```
-python main.py --address "1513 ABBOTSTON ST"
+python src/main.py --address "1513 ABBOTSTON ST"
 ```
 
 To test with a single account number:
 
 ```
-python main.py --account "11000172386"
+python src/main.py --account "11000172386"
 ```
 
 ## File Structure
 
-- `config.py`: Configuration settings
-- `scraper.py`: Web scraping functionality
-- `sheets.py`: Google Sheets integration
-- `main.py`: Main execution script
+- `src/main.py`: Main execution script
+- `src/scraper.py`: Water bill web scraping functionality
+- `src/property_api.py`: Maryland property data API client
+- `src/sheets.py`: Google Sheets integration
+- `src/config.py`: Configuration settings
 - `secrets/`: Directory for credentials (not in version control)
   - `google_credentials.py`: Imported credentials
   - `service_account.json`: Service account credentials
 
 ## Requirements
 
-Create a `requirements.txt` file with:
+See `requirements.txt` for the complete list of dependencies:
 
 ```
-requests
-beautifulsoup4
-google-api-python-client
-google-auth
-google-auth-httplib2
-google-auth-oauthlib
-pydantic
+requests>=2.25.1
+beautifulsoup4>=4.9.3
+google-api-python-client>=2.0.0
+google-auth>=2.0.0
+google-auth-httplib2>=0.1.0
+google-auth-oauthlib>=0.4.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+python-dotenv>=0.19.0
 ```

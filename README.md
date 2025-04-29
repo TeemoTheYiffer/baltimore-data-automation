@@ -185,3 +185,66 @@ pydantic>=2.0.0
 pydantic-settings>=2.0.0
 python-dotenv>=0.19.0
 ```
+
+# Integration Instructions
+
+To incorporate all these improvements, follow these steps:
+
+1. Add the new cache_manager.py file to your src directory
+2. Add the new connection_manager.py file to your src directory
+3. Add the new configuration options to your existing config.py file
+4. Replace the batch_update_bill_details method in sheets.py with the improved version
+5. Add the _process_individual_updates method to sheets.py
+6. Replace the batch_update_property_data method in sheets.py with the improved version
+7. Add the _process_individual_property_updates method to sheets.py
+8. Update your main.py imports to include:
+   ```python
+   from cache_manager import CacheManager
+   from connection_manager import ConnectionManager
+   ```
+9. In main.py, modify your main() function to initialize the ConnectionManager
+   ```python
+   # Initialize connection manager to improve TCP/IP reliability
+   connection_manager = ConnectionManager()
+   logger.info("Connection manager initialized")
+   ```
+
+Then use the modified versions of process_addresses_for_bill_details and process_addresses_for_property_data functions that include the cache_manager parameter.
+
+For immediate testing without modifying all files, you can use this temporary fix for your current connection issue:
+
+```python
+# Add this at the top of your script
+import socket
+socket.setdefaulttimeout(300)  # Increase timeout to 5 minutes
+
+# And reduce your batch size by adding this before running
+settings.BATCH_SIZE = 50  # Reduce from default 500
+```
+
+## Key Improvements
+
+1. **Batch Size Management**:
+   - Reduced default batch size from 500 to 50 rows
+   - Added recursive batch splitting on errors
+   - Progressive reduction of batch sizes when encountering connection issues
+
+2. **Connection Error Handling**:
+   - Added specific handling for WinError 10053
+   - Improved socket timeout settings
+   - Better TCP/IP configuration for Windows systems
+
+3. **Robust Retry Logic**:
+   - Exponential backoff with jitter
+   - Different retry strategies for different error types
+   - Graceful fallback to individual updates
+
+4. **Enhanced Caching**:
+   - Immediate caching of fetched data
+   - Recovery of previously processed items
+   - Cache cleanup only after successful sheet updates
+
+5. **Configurable Behavior**:
+   - Added settings to easily adjust batch sizes and retry counts
+   - Command-line parameters for cache control
+   - Adjustable timeout settings

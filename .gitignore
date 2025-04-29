@@ -137,9 +137,8 @@ VSCode_Workspace.code-workspace
 bot.session
 .vscode/settings.json
 
-src/config.py
 repopackpy-output.txt
-
-secrets
+app_secrets
 google_credentials.py
 files.txt
+\[OLD]*

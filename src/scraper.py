@@ -6,17 +6,18 @@ import requests
 from requests.exceptions import RequestException
 from bs4 import BeautifulSoup
 
-from config import Settings
+from config import AppConfig
+from utils.address_utils import parse_address, get_simplified_address
 
 # Setup logging
-logger = logging.getLogger("baltimore_water")
+logger = logging.getLogger("scraper")
 
 class WaterBillScraper:
     """Scraper for Baltimore City water bill website."""
     
-    def __init__(self, settings: Optional[Settings] = None):
+    def __init__(self, config: Optional[AppConfig] = None):
         """Initialize the scraper with settings."""
-        self.settings = settings or Settings()
+        self.config = config or AppConfig()
         self.session = requests.Session()
         self.verification_token = None
     
@@ -30,29 +31,27 @@ class WaterBillScraper:
         Returns:
             Dictionary with bill details or error information
         """
+        original_address = service_address
+        
         try:
-            # Try with the original address first
-            account_result = self.get_account_number_for_address(service_address)
+            # Parse and clean the address
+            cleaned_address, _, _ = parse_address(service_address)
             
-            # If the first attempt failed, try with just the street number and name
+            # Try with the cleaned address first
+            logger.info(f"Searching for cleaned address: {cleaned_address}")
+            account_result = self.get_account_number_for_address(cleaned_address)
+            
+            # If the first attempt failed, try with a simplified address
             if not account_result.get("success"):
-                # Parse address to get just the number and street name
-                address_parts = service_address.split()
-                
-                if len(address_parts) >= 2:
-                    # Handle leading zeros in the address number
-                    if address_parts[0].startswith('0'):
-                        address_parts[0] = address_parts[0].lstrip('0')
-                    
-                    # Just use the first two parts (number and street name)
-                    simplified_address = f"{address_parts[0]} {address_parts[1]}"
+                simplified_address = get_simplified_address(service_address)
+                if simplified_address != cleaned_address:
                     logger.info(f"Trying simplified address: {simplified_address}")
                     account_result = self.get_account_number_for_address(simplified_address)
             
             if not account_result.get("success"):
                 return {
                     "success": False,
-                    "message": f"No account found for address: {service_address}"
+                    "message": f"No account found for address: {original_address}"
                 }
             
             account_number = account_result.get("account_number")
@@ -60,14 +59,14 @@ class WaterBillScraper:
             if not account_number:
                 return {
                     "success": False,
-                    "message": f"No account found for address: {service_address}"
+                    "message": f"No account found for address: {original_address}"
                 }
             
             # Step 2: Get bill details using the account number
             return self.get_bill_details_by_account_number(account_number)
                 
         except Exception as e:
-            logger.error(f"Error getting water bill details: {e}")
+            logger.error(f"Error getting water bill details for {original_address}: {e}")
             return {
                 "success": False,
                 "message": f"Error: {str(e)}"
@@ -89,7 +88,7 @@ class WaterBillScraper:
                 self._fetch_verification_token()
             
             # Step 2: Search by service address
-            search_endpoint = f"{self.settings.BASE_URL}{self.settings.ADDRESS_SEARCH_ENDPOINT}"
+            search_endpoint = f"{self.config.BASE_URL}{self.config.ADDRESS_SEARCH_ENDPOINT}"
             search_data = {
                 'ServiceAddress': service_address,
                 '__RequestVerificationToken': self.verification_token
@@ -100,7 +99,7 @@ class WaterBillScraper:
             response = self.session.post(
                 search_endpoint,
                 data=search_data,
-                timeout=self.settings.REQUEST_TIMEOUT,
+                timeout=self.config.REQUEST_TIMEOUT,
                 allow_redirects=False
             )
             
@@ -155,7 +154,7 @@ class WaterBillScraper:
                 self._fetch_verification_token()
             
             # Submit account number search
-            account_endpoint = f"{self.settings.BASE_URL}{self.settings.ACCOUNT_SEARCH_ENDPOINT}"
+            account_endpoint = f"{self.config.BASE_URL}{self.config.ACCOUNT_SEARCH_ENDPOINT}"
             account_data = {
                 'AccountNumber': account_number,
                 '__RequestVerificationToken': self.verification_token
@@ -166,7 +165,7 @@ class WaterBillScraper:
             response = self.session.post(
                 account_endpoint,
                 data=account_data,
-                timeout=self.settings.REQUEST_TIMEOUT,
+                timeout=self.config.REQUEST_TIMEOUT,
                 allow_redirects=False
             )
             
@@ -188,16 +187,16 @@ class WaterBillScraper:
                 # Follow the redirect
                 bill_response = self.session.get(
                     redirect_url,
-                    timeout=self.settings.REQUEST_TIMEOUT
+                    timeout=self.config.REQUEST_TIMEOUT
                 )
                 
                 if bill_response.status_code != 200:
                     # Try alternative URL if 404
                     if bill_response.status_code == 404:
-                        alt_url = f"{self.settings.BASE_URL}bill"
+                        alt_url = f"{self.config.BASE_URL}bill"
                         bill_response = self.session.get(
                             alt_url,
-                            timeout=self.settings.REQUEST_TIMEOUT
+                            timeout=self.config.REQUEST_TIMEOUT
                         )
                 
                 if bill_response.status_code == 200:
@@ -240,8 +239,8 @@ class WaterBillScraper:
         """Fetch verification token from the main page."""
         try:
             response = self.session.get(
-                self.settings.BASE_URL,
-                timeout=self.settings.REQUEST_TIMEOUT
+                self.config.BASE_URL,
+                timeout=self.config.REQUEST_TIMEOUT
             )
             
             response.raise_for_status()
@@ -291,7 +290,7 @@ class WaterBillScraper:
             return f"https://pay.baltimorecity.gov{location}"
         else:
             # Location is a relative path without /water/
-            return f"{self.settings.BASE_URL}{location.lstrip('/')}"
+            return f"{self.config.BASE_URL}{location.lstrip('/')}"
     
     def _extract_bill_details(self, html_content: str, account_number: str) -> Dict[str, Any]:
         """Extract bill details from HTML content."""
@@ -312,6 +311,7 @@ class WaterBillScraper:
             "service_address": (r'<b>Service Address</b>\s*([^<]+)', "serviceAddress"),
             "bill_date": (r'<b>Current Bill Date</b>\s*(\d{2}/\d{2}/\d{4})', "billDate"),
             "current_bill_amount": (r'<b>Current Bill Amount</b>\s*\$\s*([\d.]+)', "currentBillAmount"),
+            "previous_balance": (r'<b>Previous Balance</b>\s*\$\s*([\d.]+)', "previousBalance"),
             "current_balance": (r'<b>Current Balance</b>\s*\$\s*([\d.]+)', "currentBalance"),
             "penalty_date": (r'<b>Penalty Date</b>\s*(\d{2}/\d{2}/\d{4})', "penaltyDate"),
             "last_payment_date": (r'<b>Last Pay Date</b>\s*(\d{2}/\d{2}/\d{4})', "lastPaymentDate"),

@@ -274,6 +274,10 @@ async def process_batch(
         job_config.PROCESSING_MODE = request.mode
         job_config.COUNTIES = request.counties
 
+        # Set the current county based on the first county in the request
+        if request.counties:
+            job_config.set_current_county(request.counties[0])
+
         # Use the spreadsheet_id from request if provided, otherwise use county-specific defaults
         if request.spreadsheet_id:
             # Override the spreadsheet ID for all counties in this batch
@@ -358,6 +362,13 @@ async def run_batch_processing_job(
     """Run a batch processing job in the background."""
     try:
         logger.info(f"Job {job_id} starting with config: MAX_ROWS={config.MAX_ROWS}, START_ROW={config.START_ROW}")
+        
+        # Add this block to set the current county based on the first county in the list
+        if config.COUNTIES and len(config.COUNTIES) > 0:
+            first_county = config.COUNTIES[0]
+            logger.info(f"Setting current county to {first_county}")
+            config.set_current_county(first_county)
+        
         # Initialize progress
         update_job_progress(
             job_id=job_id, 

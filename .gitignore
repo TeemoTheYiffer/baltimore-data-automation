@@ -142,3 +142,4 @@ app_secrets
 google_credentials.py
 files.txt
 \[OLD]*
+.vscode/launch.json

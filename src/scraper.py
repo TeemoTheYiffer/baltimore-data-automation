@@ -1,7 +1,6 @@
 import re
-import time
 import logging
-from typing import Dict, Optional, Any, Union
+from typing import Dict, Optional, Any
 import requests
 from requests.exceptions import RequestException
 from bs4 import BeautifulSoup
@@ -302,7 +301,7 @@ class WaterBillScraper:
             }
         
         # Use BeautifulSoup for more robust extraction
-        soup = BeautifulSoup(html_content, 'html.parser')
+        BeautifulSoup(html_content, 'html.parser')
         
         extracted_data = {"account_number": account_number}
         
@@ -320,7 +319,7 @@ class WaterBillScraper:
         }
         
         # Extract data using regex patterns
-        for key, (pattern, field_name) in extraction_patterns.items():
+        for key, (pattern, _field_name) in extraction_patterns.items():
             match = re.search(pattern, html_content)
             if match:
                 extracted_data[key] = match.group(1).strip()

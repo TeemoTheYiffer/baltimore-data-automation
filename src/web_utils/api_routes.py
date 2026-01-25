@@ -54,7 +54,7 @@ async def process_water_bills(
     except Exception as e:
         logger.exception(f"Error processing water bills: {e}")
         job_store.update_job_progress(
-            job_id=job_id, status="running", message=f"Water bill error: {str(e)}"
+            job_id=job_id, progress=0, status="failed", message=f"Water bill error: {str(e)}"
         )
 
 
@@ -81,42 +81,36 @@ async def process_property_data(
         # Import here to avoid circular imports
         from routes import process_county_property_data
 
-        counties = config.get_counties_to_process()
-        logger.info(f"Processing {len(counties)} counties: {', '.join(counties)}")
+        # Get the single county from the current config
+        county = config._current_county
+        logger.info(f"Processing single county: {county}")
 
-        # Calculate progress for property processing
-        progress_per_county = 60 / max(len(counties), 1)  # Avoid division by zero
+        job_store.update_job_progress(
+            job_id=job_id,
+            progress=50,
+            message=f"Processing {county} county property data",
+        )
 
-        for i, county in enumerate(counties):
-            # Update progress before processing this county
-            current_progress = 40 + i * progress_per_county
-            job_store.update_job_progress(
-                job_id=job_id,
-                progress=int(current_progress),
-                message=f"Processing {county} county ({i + 1}/{len(counties)})",
-            )
+        # Process the single county
+        await asyncio.to_thread(
+            process_county_property_data,
+            county_name=county,
+            config=config,
+            sheets_manager=sheets_manager,
+            sheet_name=property_sheet_name,
+            cache_manager=cache_manager,
+        )
 
-            # Process county
-            await asyncio.to_thread(
-                process_county_property_data,
-                county_name=county,
-                config=config,
-                sheets_manager=sheets_manager,
-                sheet_name=property_sheet_name,
-                cache_manager=cache_manager,
-            )
-
-            # Update progress after processing this county
-            current_progress = 40 + (i + 1) * progress_per_county
-            job_store.update_job_progress(
-                job_id=job_id,
-                progress=int(current_progress),
-                message=f"Completed {county} county ({i + 1}/{len(counties)})",
-            )
+        job_store.update_job_progress(
+            job_id=job_id,
+            progress=80,
+            message=f"Completed {county} county property data",
+        )
     except Exception as e:
         logger.exception(f"Error processing property data: {e}")
         job_store.update_job_progress(
             job_id=job_id,
-            status="running",
+            progress=0,
+            status="failed", 
             message=f"Property data error: {str(e)}",
         )

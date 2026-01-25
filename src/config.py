@@ -1,8 +1,13 @@
 from pydantic import Field, ConfigDict
 from pydantic_settings import BaseSettings
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, TYPE_CHECKING
 from enum import Enum
+import logging
 
+if TYPE_CHECKING:
+    from web_utils.models import ProcessBatchRequestModel # noqa: F401
+
+logger = logging.getLogger("config")
 
 class CountyEnum(str, Enum):
     """Enum for supported counties."""
@@ -10,21 +15,17 @@ class CountyEnum(str, Enum):
     BALTIMORE = "baltimore"
     PG = "pg"
     FREDERICK = "frederick"
+    MONTGOMERY = "montgomery"  
+    ALLEGANY = "allegany"      
+    HARFORD = "harford"        
+    DORCHESTER = "dorchester"
+    ANNE_ARUNDEL = "anne_arundel"  
+    HOWARD = "howard"              
 
     @classmethod
     def get_all(cls) -> List[str]:
         """Return all county values."""
         return [county.value for county in cls]
-
-
-class ProcessingMode(str, Enum):
-    """Enum for processing modes."""
-
-    WATER = "water"
-    PROPERTY = "property"
-    BOTH = "both"
-    ALL = "all"
-
 
 class CountyConfig:
     """Configuration for a specific county data source."""
@@ -38,6 +39,7 @@ class CountyConfig:
         field_mapping: dict = None,
         parcel_digits: int = 0,
         spreadsheet_id: str = None,
+        optional_params: dict = None,
     ):
         """Initialize county configuration."""
         self.county_name = county_name.lower()
@@ -47,15 +49,10 @@ class CountyConfig:
         self.field_mapping = field_mapping or {}
         self.parcel_digits = parcel_digits
         self.spreadsheet_id = spreadsheet_id
-
+        self.optional_params = optional_params or {}
 
 class AppConfig(BaseSettings):
     """Application configuration with improved handling of environment variables and files."""
-
-    # County-specific spreadsheet IDs
-    BALTIMORE_SPREADSHEET_ID: str = "1x6uS3zlpiW6eoRu_DZfzLToxFtwZMurlwPdhkNFmPZM"  # "11zAmo1qTw1kDPjgOXWC6VN848CG5rWxJJ-rsjzAcNVU"
-    PG_SPREADSHEET_ID: str = "17yr2OwW4GrhgfUXLGTYOCXKlJov8hqe9Ozg_yOvNR74"
-    FREDERICK_SPREADSHEET_ID: str = "1vcBR_gGoZCSmhbmA0CLrYH-2kc3O8P9ycUEokywqC20"
 
     # Current county being processed (defaults to baltimore)
     _current_county: str = "baltimore"
@@ -63,13 +60,18 @@ class AppConfig(BaseSettings):
     # Runtime configuration
     LOG_LEVEL: str = "INFO"  # Can be DEBUG, INFO, WARNING, ERROR, CRITICAL
     VERBOSE_LOGGING: bool = False  # Set to True for detailed logs, False for summaries
-    PROCESSING_MODE: ProcessingMode = ProcessingMode.PROPERTY
-    COUNTIES: List[str] = Field(default_factory=lambda: ["frederick"])
+    PROCESSING_MODE: str = "property"
     SHEET_NAME: Optional[str] = "LIENS"
-    DEBUG_MODE: bool = False
+    DEBUG_MODE: bool = False  # For things like verbose API output, debug endpoints, etc.
     MAX_WORKERS: int = 10  # Maximum number of threads for concurrent requests
     MAX_RETRIES: int = 3  # Maximum retries for failed requests
     COUNTY_CONFIGS: Dict[str, CountyConfig] = Field(default_factory=dict)
+    FORCE_REPROCESS: bool = False
+
+    # Job-specific fields (set dynamically from API request)
+    START_ROW: Optional[int] = Field(default=None)
+    STOP_ROW: Optional[int] = Field(default=None) 
+    MAX_ROWS: Optional[int] = Field(default=None)
 
     # Database/connection settings
     TCP_TIMEOUT: int = 300
@@ -81,18 +83,9 @@ class AppConfig(BaseSettings):
     SERVICE_ACCOUNT_FILE: Optional[str] = None
     IMPERSONATED_USER: Optional[str] = None
 
-    # For debugging/testing
-    DEBUG_SINGLE_ADDRESS: Optional[str] = None
-    DEBUG_SINGLE_ACCOUNT: Optional[str] = None
-    DEBUG_SINGLE_PARCEL_ID: Optional[str] = None
-
     # Processing settings
-    REQUEST_DELAY: float = 0.5
-    START_ROW: int = 142
-    STOP_ROW: int = 145
-    MAX_ROWS: int = 10
-    SKIP_ROW_RANGE: str = ""
-    BATCH_SIZE: int = 1000
+    REQUEST_DELAY: float = 0.3
+    BATCH_SIZE: int = 100
 
     # Water bill settings
     WATER_BILL_SHEET_NAME: str = "Water Bill"
@@ -102,18 +95,28 @@ class AppConfig(BaseSettings):
     REQUEST_TIMEOUT: int = 30
     MAX_RETRIES: int = 3
 
-    # Property settings
+    # Property settings (Use '$limit=5' to limit data and $where=record_key_account_number_sdat_field_3 LIKE "" to search ParcelIDs)
     PROPERTY_SHEET_NAME: str = "LIENS"
-    BALTIMORE_URL: str = "https://opendata.maryland.gov/resource/3x3p-xk2v.json"
+    BALTIMORE_URL: str = "https://opendata.maryland.gov/resource/jpfc-qkxp.json" #CITY: "https://opendata.maryland.gov/resource/3x3p-xk2v.json"
     PG_URL: str = "https://opendata.maryland.gov/resource/w3eb-4mzd.json"
     FREDERICK_URL: str = "https://opendata.maryland.gov/resource/gx8c-a963.json"
+    MONTGOMERY_URL: str = "https://opendata.maryland.gov/resource/kb22-is2w.json"
+    ALLEGANY_URL: str = "https://opendata.maryland.gov/resource/gm7d-x6vg.json"
+    HARFORD_URL: str = "https://opendata.maryland.gov/resource/ygxu-5v84.json"
+    DORCHESTER_URL: str = "https://opendata.maryland.gov/resource/ye3m-tr66.json"
+    ANNE_ARUNDEL_URL: str = "https://opendata.maryland.gov/resource/3w75-7rie.json"
+    HOWARD_URL: str = "https://opendata.maryland.gov/resource/9t52-zebk.json"
+
     RETRY_FAILED_ROWS: bool = True
     DELAY_BETWEEN_BATCHES: float = 2.0
 
     # Field mappings
     FIELD_MAPPING: dict = {
         "ParcelID": "record_key_account_number_sdat_field_3",
+        "District": "record_key_district_ward_sdat_field_2",
         "ADDRESS": "mdp_street_address_mdp_field_address",
+        "ADDRESS_FALLBACK_NAME1": "premise_address_name_mdp_field_premsnam_sdat_field_23",  
+        "ADDRESS_FALLBACK_NAME2": "premise_address_type_mdp_field_premstyp_sdat_field_24",
         "zip": "premise_address_zip_code_mdp_field_premzip_sdat_field_26",
         "address_number": "premise_address_number_mdp_field_premsnum_sdat_field_20",
         "street_name": "premise_address_name_mdp_field_premsnam_sdat_field_23",
@@ -161,8 +164,7 @@ class AppConfig(BaseSettings):
                 identifier_type="address",
                 identifier_column="ADDRESS",
                 field_mapping=self.FIELD_MAPPING,
-                parcel_digits=0,
-                spreadsheet_id=self.BALTIMORE_SPREADSHEET_ID,
+                spreadsheet_id=None,
             ),
             "pg": CountyConfig(
                 county_name="pg",
@@ -170,8 +172,7 @@ class AppConfig(BaseSettings):
                 identifier_type="parcel_id",
                 identifier_column="ParcelID",
                 field_mapping=self.FIELD_MAPPING,
-                parcel_digits=7,
-                spreadsheet_id=self.PG_SPREADSHEET_ID,
+                spreadsheet_id=None,
             ),
             "frederick": CountyConfig(
                 county_name="frederick",
@@ -179,10 +180,116 @@ class AppConfig(BaseSettings):
                 identifier_type="parcel_id",
                 identifier_column="ParcelID",
                 field_mapping=self.FIELD_MAPPING,
-                parcel_digits=6,
-                spreadsheet_id=self.FREDERICK_SPREADSHEET_ID,
+                spreadsheet_id=None,
+            ),
+            "montgomery": CountyConfig(
+                county_name="montgomery",
+                base_url=self.MONTGOMERY_URL,
+                identifier_type="parcel_id",
+                identifier_column="ParcelID",
+                field_mapping=self.FIELD_MAPPING,
+                spreadsheet_id=None,
+            ),
+            "allegany": CountyConfig(
+                county_name="allegany",
+                base_url=self.ALLEGANY_URL,
+                identifier_type="parcel_id",
+                identifier_column="ParcelID",
+                field_mapping=self.FIELD_MAPPING,
+                spreadsheet_id=None,
+            ),
+            "harford": CountyConfig(
+                county_name="harford",
+                base_url=self.HARFORD_URL,
+                identifier_type="parcel_id",
+                identifier_column="ParcelID",
+                field_mapping=self.FIELD_MAPPING,
+                spreadsheet_id=None,
+            ),
+            "dorchester": CountyConfig(
+                county_name="dorchester",
+                base_url=self.DORCHESTER_URL,
+                identifier_type="parcel_id",
+                identifier_column="ParcelID",
+                field_mapping=self.FIELD_MAPPING,
+                spreadsheet_id=None,
+            ),
+            "anne_arundel": CountyConfig(
+                county_name="anne_arundel",
+                base_url=self.ANNE_ARUNDEL_URL,
+                identifier_type="parcel_id",
+                identifier_column="ParcelID",
+                field_mapping=self.FIELD_MAPPING,
+                spreadsheet_id=None,
+            ),
+            "howard": CountyConfig(
+                county_name="howard",
+                base_url=self.HOWARD_URL,
+                identifier_type="parcel_id",
+                identifier_column="ParcelID",
+                field_mapping=self.FIELD_MAPPING,
+                spreadsheet_id=None,
             ),
         }
+    
+    @classmethod  
+    def create_job_config_from_request(cls, request) -> "AppConfig":
+        """Create a job-specific configuration that honors API request parameters."""
+        job_config = cls()
+        
+        # Single county setup  
+        job_config.set_current_county(request.county)
+        job_config.PROCESSING_MODE = request.mode
+        
+        # Set spreadsheet for this county
+        county_config = job_config.get_county_config(request.county)
+        county_config.spreadsheet_id = request.spreadsheet_id
+        logger.info(f"Job config: Using spreadsheet_id {request.spreadsheet_id} for {request.county}")
+        
+        # NEW: Override identifier settings from request if provided
+        if hasattr(request, 'identifier_type') and request.identifier_type:
+            county_config.identifier_type = request.identifier_type
+            logger.info(f"Overriding identifier_type to '{request.identifier_type}' for {request.county}")
+        
+        if hasattr(request, 'identifier_column') and request.identifier_column:
+            county_config.identifier_column = request.identifier_column
+            logger.info(f"Overriding identifier_column to '{request.identifier_column}' for {request.county}")
+        
+        # Set parcel_digits from request, but now check the current (possibly overridden) identifier_type
+        if hasattr(request, 'parcel_digits'):
+            # Only set parcel_digits for counties that use parcel_id identifier
+            if county_config.identifier_type == "parcel_id":
+                county_config.parcel_digits = request.parcel_digits
+                logger.info(f"Set parcel_digits to {request.parcel_digits} for {request.county}")
+            else:
+                logger.info(f"Ignoring parcel_digits for {request.county} (uses {county_config.identifier_type} identifier)")
+
+        # Handle optional_params from request
+        if hasattr(request, 'optional_params') and request.optional_params:
+            county_config.optional_params = request.optional_params
+            logger.info(f"Set optional_params for {request.county}: {request.optional_params}")
+        else:
+            county_config.optional_params = {}
+
+        # Set parameters from request
+        job_config.SHEET_NAME = getattr(request, 'sheet_name', 'LIENS')
+        job_config.START_ROW = getattr(request, 'start_row', 2)
+        job_config.MAX_ROWS = getattr(request, 'max_rows', 100)
+        job_config.FORCE_REPROCESS = getattr(request, 'force_reprocess', False)
+        job_config.BATCH_SIZE = getattr(request, 'batch_size', 1000)
+        
+        # Smart stop_row logic
+        requested_stop_row = getattr(request, 'stop_row', 0)
+        if requested_stop_row and requested_stop_row > 0:
+            job_config.STOP_ROW = requested_stop_row
+            job_config._stop_row_was_set = True
+            logger.info(f"Using explicit stop_row: {requested_stop_row}")
+        else:
+            job_config.STOP_ROW = 0
+            job_config._stop_row_was_set = False
+            logger.info(f"Using max_rows logic: start_row={job_config.START_ROW} + max_rows={job_config.MAX_ROWS}")
+
+        return job_config
 
     def get_county_config(self, county_name: str) -> CountyConfig:
         """Get county configuration by name (case-insensitive)."""
@@ -194,63 +301,14 @@ class AppConfig(BaseSettings):
         elif county_name in ["baltimore_city", "baltimore city"]:
             county_name = "baltimore"
 
-        return self.COUNTY_CONFIGS.get(county_name, self.COUNTY_CONFIGS["baltimore"])
-
-    def get_counties_to_process(self) -> List[str]:
-        """Get list of counties to process based on configuration."""
-        if "all" in self.COUNTIES:
-            return CountyEnum.get_all()
-        return self.COUNTIES
-
-    @property
-    def SPREADSHEET_ID(self):
-        """Backward compatibility property that returns the spreadsheet ID for the current county"""
-        return self.get_spreadsheet_id(self._current_county)
+        if county_name not in self.COUNTY_CONFIGS:
+            valid_counties = list(self.COUNTY_CONFIGS.keys())
+            raise ValueError(f"Unsupported county '{county_name}'. Valid counties are: {valid_counties}")
+        
+        config = self.COUNTY_CONFIGS[county_name]
+        logger.info(f"County config for {county_name}: identifier_type={config.identifier_type}, identifier_column={config.identifier_column}")
+        return config
 
     def set_current_county(self, county_name: str):
         """Set the current county being processed"""
         self._current_county = county_name
-
-    def get_spreadsheet_id(self, county_name: str = None) -> str:
-        """Get spreadsheet ID for a specific county or the current county"""
-        county = county_name or self._current_county
-
-        # Normalize county name
-        county = county.lower().strip()
-
-        # Return the appropriate spreadsheet ID based on county
-        if county in ["pg", "prince_george", "prince georges", "pg_county"]:
-            return self.PG_SPREADSHEET_ID
-        elif county in ["baltimore", "baltimore_city", "baltimore city"]:
-            return self.BALTIMORE_SPREADSHEET_ID
-        elif county in ["frederick"]:
-            return self.FREDERICK_SPREADSHEET_ID
-
-        # Default fallback
-        return self.BALTIMORE_SPREADSHEET_ID
-    
-    @classmethod
-    def create_job_config(cls, request_data: dict) -> "AppConfig":
-        """Create a job-specific configuration from request data."""
-        job_config = cls()
-        
-        # Apply request overrides
-        if "mode" in request_data and request_data["mode"]:
-            job_config.PROCESSING_MODE = request_data["mode"]
-            
-        if "counties" in request_data and request_data["counties"]:
-            job_config.COUNTIES = request_data["counties"]
-            
-        if "spreadsheet_id" in request_data and request_data["spreadsheet_id"]:
-            # Apply spreadsheet_id to all counties
-            for county in job_config.COUNTIES:
-                county_config = job_config.get_county_config(county)
-                county_config.spreadsheet_id = request_data["spreadsheet_id"]
-        
-        # Set other job parameters
-        job_config.SHEET_NAME = request_data.get("sheet_name", job_config.SHEET_NAME)
-        job_config.START_ROW = request_data.get("start_row", job_config.START_ROW)
-        job_config.STOP_ROW = request_data.get("stop_row", job_config.STOP_ROW)
-        job_config.MAX_ROWS = request_data.get("max_rows", job_config.MAX_ROWS)
-        
-        return job_config

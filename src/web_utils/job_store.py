@@ -1,6 +1,6 @@
 import time
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import uuid
 
 logger = logging.getLogger("job_store")
@@ -45,15 +45,26 @@ class JobStore:
                 "created_at": time.time()
             }
     
-    def update_job_progress(self, job_id: str, progress: int, status: str = "running", message: Optional[str] = None):
-        """Update job progress in Redis or memory."""
+    def update_job_progress(self, job_id: str, progress: int, status: str = "running", 
+                        message: Optional[str] = None, errors: Optional[List[str]] = None,
+                        error_count: Optional[int] = None, success_count: Optional[int] = None,
+                        total_processed: Optional[int] = None):
+        """Update job progress with detailed error tracking."""
         if self.use_redis:
             key = f"job:{job_id}"
             self.redis.hset(key, "progress", progress)
             self.redis.hset(key, "status", status)
             if message:
                 self.redis.hset(key, "message", message)
-            self.redis.expire(key, 86400)  # 24 hour expiration
+            if errors:
+                self.redis.hset(key, "errors", ",".join(errors[:10]))  # Store last 10 errors
+            if error_count is not None:
+                self.redis.hset(key, "error_count", error_count)
+            if success_count is not None:
+                self.redis.hset(key, "success_count", success_count)
+            if total_processed is not None:
+                self.redis.hset(key, "total_processed", total_processed)
+            self.redis.expire(key, 86400)
         else:
             # In-memory fallback
             if job_id not in self.jobs:
@@ -62,6 +73,14 @@ class JobStore:
             self.jobs[job_id]["status"] = status
             if message:
                 self.jobs[job_id]["message"] = message
+            if errors:
+                self.jobs[job_id]["errors"] = errors[:10]  # Keep last 10 errors
+            if error_count is not None:
+                self.jobs[job_id]["error_count"] = error_count
+            if success_count is not None:
+                self.jobs[job_id]["success_count"] = success_count
+            if total_processed is not None:
+                self.jobs[job_id]["total_processed"] = total_processed
     
     def get_job_status(self, job_id: str) -> Optional[Dict[str, Any]]:
         """Get job status from Redis or memory."""

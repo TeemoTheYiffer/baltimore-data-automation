@@ -143,3 +143,6 @@ google_credentials.py
 files.txt
 \[OLD]*
 .vscode/launch.json
+src/.claude/settings.local.json
+.gitignore
+CLAUDE.md

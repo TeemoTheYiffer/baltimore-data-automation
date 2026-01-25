@@ -76,7 +76,7 @@ class SheetsManager:
         spreadsheet_id = (
             county_config.spreadsheet_id
             if county_config
-            else self.config.SPREADSHEET_ID
+            else self.spreadsheet_id
         )
         cache_key = f"{spreadsheet_id}:{sheet_name}"
 
@@ -117,6 +117,63 @@ class SheetsManager:
                     raise
 
         raise RuntimeError("Failed to fetch sheet headers after multiple retries")
+    
+    def _execute_batch_get_with_retry(self, batch_ranges: List[str], batch_name: str) -> Optional[Dict]:
+        """Execute batchGet with basic retry for rate limits and connection errors."""
+        max_retries = 3
+        
+        for attempt in range(max_retries):
+            try:
+                result = (
+                    self.service.spreadsheets()
+                    .values()
+                    .batchGet(spreadsheetId=self.spreadsheet_id, ranges=batch_ranges)
+                    .execute()
+                )
+                
+                if attempt > 0:
+                    logger.info(f"Successfully retrieved {batch_name} after {attempt + 1} attempts")
+                
+                return result
+                
+            except HttpError as e:
+                if e.resp.status == 429:  # Rate limit error
+                    wait_time = (2 ** attempt) + random.random()
+                    logger.warning(f"Rate limit, waiting {wait_time:.2f}s before retry {attempt + 1}")
+                    time.sleep(wait_time)
+                    if attempt == max_retries - 1:
+                        raise
+                else:
+                    logger.error(f"HTTP error in {batch_name}: {e}")
+                    raise
+            except Exception as e:
+                logger.error(f"Error in {batch_name}: {e}")
+                raise
+        
+        return None
+
+    def _get_sheet_dimensions(self, sheet_name: str) -> tuple[int, int]:
+        """Get the actual dimensions of a sheet."""
+        try:
+            sheet_metadata = self.service.spreadsheets().get(
+                spreadsheetId=self.spreadsheet_id,
+                fields="sheets.properties"
+            ).execute()
+            
+            for sheet in sheet_metadata.get('sheets', []):
+                if sheet['properties']['title'] == sheet_name:
+                    grid_props = sheet['properties']['gridProperties']
+                    row_count = grid_props['rowCount']
+                    col_count = grid_props['columnCount']
+                    logger.info(f"Sheet '{sheet_name}' dimensions: {row_count} rows x {col_count} columns")
+                    return row_count, col_count
+                    
+            logger.warning(f"Sheet '{sheet_name}' not found in spreadsheet")
+            return 1000, 26  # Default fallback
+            
+        except Exception as e:
+            logger.warning(f"Could not get sheet dimensions: {e}")
+            return 1000, 26  # Default fallback
 
     def update_county(self, county_name: str, config: Optional[AppConfig] = None):
         """Update the county and spreadsheet ID."""
@@ -137,7 +194,8 @@ class SheetsManager:
             county_config: County-specific configuration
 
         Returns:
-            List of (row_index, identifier) tuples
+            List of (row_index, identifier, row_optional_params) tuples
+            where row_optional_params is a dict like {"District": "01"}
         """
         try:
             # Fetch headers to find identifier and Status columns
@@ -163,6 +221,22 @@ class SheetsManager:
             if status_col_index == -1:
                 raise ValueError("Status column not found in headers")
 
+            # Find optional parameter columns if specified
+            optional_param_columns = {}  # Maps column_name -> column_index
+            optional_param_mapping = {}  # Maps column_name -> field_mapping_key
+
+            if county_config.optional_params:
+                for column_name, field_mapping_key in county_config.optional_params.items():
+                    col_index = header_map.get(column_name.lower(), -1)
+                    if col_index == -1:
+                        raise ValueError(f"Optional parameter column '{column_name}' not found in headers")
+                    
+                    optional_param_columns[column_name] = col_index
+                    optional_param_mapping[column_name] = field_mapping_key
+                    logger.info(f"Found optional parameter column '{column_name}' -> '{field_mapping_key}' at index {col_index}")
+
+            logger.info(f"Optional parameter columns: {list(optional_param_columns.keys())}")
+
             # Determine range based on PROPERTY settings
             start_row = config.START_ROW
             if config.STOP_ROW > 0:
@@ -170,7 +244,13 @@ class SheetsManager:
             else:
                 end_row = start_row + config.MAX_ROWS - 1
 
-            logger.info(f"Fetching property data from row {start_row} to {end_row}")
+            max_sheet_rows, max_sheet_cols = self._get_sheet_dimensions(sheet_name)
+
+            if end_row > max_sheet_rows:
+                logger.warning(f"Requested end_row {end_row} exceeds sheet size {max_sheet_rows}. Adjusting to {max_sheet_rows}")
+                end_row = max_sheet_rows
+
+            logger.info(f"Fetching property data from row {start_row} to {end_row} (sheet has {max_sheet_rows} rows)")
 
             # Get the status values
             status_col_letter = self.col_num_to_letter(status_col_index)
@@ -178,7 +258,7 @@ class SheetsManager:
             status_result = (
                 self.service.spreadsheets()
                 .values()
-                .get(spreadsheetId=config.SPREADSHEET_ID, range=status_range)
+                .get(spreadsheetId=self.spreadsheet_id, range=status_range)
                 .execute()
             )
 
@@ -187,65 +267,45 @@ class SheetsManager:
 
             # Parse skip ranges from PROPERTY settings
             rows_to_skip = set()
-            if config.SKIP_ROW_RANGE:
-                for part in config.SKIP_ROW_RANGE.split(","):
-                    if "-" in part:
-                        start_skip, end_skip = map(int, part.split("-"))
-                        for row in range(start_skip, end_skip + 1):
-                            rows_to_skip.add(row)
-                    else:
-                        try:
-                            rows_to_skip.add(int(part.strip()))
-                        except ValueError:
-                            continue
 
-            # If status_values is empty, it means all cells in that range are empty
-            # Therefore, all rows need processing
-            if not status_values:
-                logger.info(
-                    "No status values found in range - treating all rows as needing processing"
-                )
-                rows_to_process = [
-                    row
-                    for row in range(start_row, end_row + 1)
-                    if row not in rows_to_skip
-                ]
-            else:
-                # Find which rows need processing
-                rows_to_process = []
-                for i, row_status in enumerate(status_values):
-                    actual_row = start_row + i
+            # Create a status lookup dictionary for rows that have status values
+            status_lookup = {}
+            for i, row_status in enumerate(status_values):
+                actual_row = start_row + i
+                status_raw = row_status[0] if row_status and len(row_status) > 0 else ""
+                status_lookup[actual_row] = status_raw.strip() if status_raw else ""
 
-                    # Skip rows in the skip list
-                    if actual_row in rows_to_skip:
-                        logger.info(
-                            f"Skipping row {actual_row} as specified in SKIP_ROW_RANGE"
-                        )
-                        continue
+            logger.info(f"Status values found for {len(status_lookup)} rows")
 
-                    status_raw = (
-                        row_status[0] if row_status and len(row_status) > 0 else ""
-                    )
-                    status = status_raw.strip() if status_raw else ""
+            # Now check ALL rows in the requested range, not just ones with status
+            rows_to_process = []
+            for row in range(start_row, end_row + 1):
+                # Skip rows in the skip list
+                if row in rows_to_skip:
+                    logger.info(f"Skipping row {row} as specified in SKIP_ROW_RANGE")
+                    continue
 
-                    # Check status if available
-                    skip_row = False
+                # Get status for this row (empty string if no status)
+                status = status_lookup.get(row, "").strip()
+                
+                skip_row = False
 
-                    # Skip rows with "Success" status
+                # Only skip if row has a status and force_reprocess is False
+                if status and not config.FORCE_REPROCESS:
                     if status.lower() in ["success", "skipped"]:
                         skip_row = True
-                        logger.info(f"Skipping row {actual_row} with status: {status}")
-
+                        logger.info(f"Skipping row {row} with status: {status}")
+                    
                     # Skip rows with failed lookups if not retrying failed rows
                     no_data_msg = f"no data found for {county_config.identifier_type}"
                     if no_data_msg in status.lower() and not config.RETRY_FAILED_ROWS:
                         skip_row = True
-                        logger.info(
-                            f"Skipping row {actual_row} with status containing '{no_data_msg}' (RETRY_FAILED_ROWS is False)"
-                        )
+                        logger.info(f"Skipping row {row} with status containing '{no_data_msg}' (RETRY_FAILED_ROWS is False)")
 
-                    if not skip_row:
-                        rows_to_process.append(actual_row)
+                if not skip_row:
+                    rows_to_process.append(row)
+                    if not status:  # Log when processing rows without status
+                        logger.debug(f"Processing row {row} (no previous status)")
 
             logger.info(f"Found {len(rows_to_process)} rows that need processing")
 
@@ -254,37 +314,81 @@ class SheetsManager:
             identifier_data = []
 
             # Process in smaller batches to avoid large API calls
-            batch_size = 100
+            columns_per_row = 1 + len(optional_param_columns)
+            max_ranges_per_call = 200  # Google's limit
+            batch_size = min(100, max_ranges_per_call // columns_per_row)
+            logger.info(f"Using batch size {batch_size} for {columns_per_row} columns per row")
             for i in range(0, len(rows_to_process), batch_size):
                 batch = rows_to_process[i : i + batch_size]
                 batch_ranges = []
                 for row in batch:
+                    # Add identifier column
                     batch_ranges.append(f"{sheet_name}!{identifier_col_letter}{row}")
+                    
+                    # Add optional parameter columns
+                    for column_name, col_index in optional_param_columns.items():
+                        col_letter = self.col_num_to_letter(col_index)
+                        batch_ranges.append(f"{sheet_name}!{col_letter}{row}")
 
                 if not batch_ranges:
                     continue
 
                 # Get identifiers for this batch
-                result = (
-                    self.service.spreadsheets()
-                    .values()
-                    .batchGet(spreadsheetId=config.SPREADSHEET_ID, ranges=batch_ranges)
-                    .execute()
+                result = self._execute_batch_get_with_retry(
+                    batch_ranges, f"batch {i//batch_size + 1}"
                 )
+                
+                if not result:  # Skip this batch if it failed completely
+                    logger.warning(f"Skipping batch {i//batch_size + 1} due to range errors")
+                    continue
 
                 value_ranges = result.get("valueRanges", [])
-                for j, value_range in enumerate(value_ranges):
-                    row_values = value_range.get("values", [[]])[0]
-                    if not row_values:
-                        continue
+                
+                # Calculate number of columns per row (1 identifier + N optional params)
+                columns_per_row = 1 + len(optional_param_columns)
 
-                    identifier = row_values[0].strip() if row_values[0] else ""
-                    if identifier:
-                        # Return absolute row index adjusted to be 0-indexed
-                        row_index = (
-                            rows_to_process[i + j] - 2
-                        )  # -2 to convert from 1-indexed sheet to 0-indexed program
-                        identifier_data.append((row_index, identifier))
+                for j in range(len(batch)):
+                    if j * columns_per_row >= len(value_ranges):
+                        continue
+                        
+                    # Get identifier value
+                    identifier_range = value_ranges[j * columns_per_row]
+                    identifier_values = identifier_range.get("values", [[]])[0]
+                    identifier = identifier_values[0].strip() if identifier_values and identifier_values[0] else ""
+                    
+                    if not identifier:
+                        continue
+                    
+                    # Get optional parameter values for this row
+                    row_optional_params = {}
+                    for k, (column_name, field_mapping_key) in enumerate(optional_param_mapping.items()):
+                        param_range_index = j * columns_per_row + 1 + k
+                        if param_range_index < len(value_ranges):
+                            param_range = value_ranges[param_range_index]
+                            param_values = param_range.get("values", [[]])[0]
+                            param_value = param_values[0].strip() if param_values and param_values[0] else ""
+                            
+                            if not param_value:
+                                # Optional parameter is required if user specified it
+                                logger.warning(f"Row {rows_to_process[i + j]}: Missing required optional parameter '{column_name}'")
+                                # Skip this row entirely - treat missing optional param as missing identifier
+                                row_optional_params = None
+                                break
+                            
+                            row_optional_params[field_mapping_key] = param_value
+                            
+                    if row_optional_params:
+                        logger.debug(f"Row {rows_to_process[i + j]}: Found optional params: {row_optional_params}")
+
+                    # Only add if we have identifier and all required optional params
+                    if identifier and row_optional_params is not None:
+                        row_index = rows_to_process[i + j] - 2  # Convert to 0-indexed
+                        identifier_data.append((row_index, identifier, row_optional_params))
+
+                    elif identifier and not optional_param_columns:
+                        # No optional params specified, use empty dict
+                        row_index = rows_to_process[i + j] - 2
+                        identifier_data.append((row_index, identifier, {}))
 
             logger.info(
                 f"Retrieved {len(identifier_data)} identifiers from {sheet_name}"
@@ -556,11 +660,9 @@ class SheetsManager:
             Google API credentials
         """
         if not self.config.SERVICE_ACCOUNT_FILE:
-            raise ValueError("No service account file specified")
-
-        if not self.config.IMPERSONATED_USER:
-            raise ValueError("No impersonated user specified")
-
+            if not self.config.IMPERSONATED_USER:
+                raise ValueError("No service account file or impersonated user specified")
+            
         logger.info(f"Impersonating user: {self.config.IMPERSONATED_USER}")
         logger.info(f"Using service account file: {self.config.SERVICE_ACCOUNT_FILE}")
 
@@ -952,6 +1054,24 @@ class SheetsManager:
             if property_data.get("success", False) and "data" in property_data:
                 data = property_data.get("data", {})
 
+                # Determine protected columns (identifier columns that should never be overwritten)
+                header_map = self._get_header_map(headers)
+                protected_columns = set()
+                if hasattr(self.config, '_current_county'):
+                    try:
+                        county_config = self.config.get_county_config(self.config._current_county)
+                        identifier_col_index = header_map.get(county_config.identifier_column.lower(), -1)
+                        if identifier_col_index >= 0:
+                            protected_columns.add(identifier_col_index)
+                    except Exception as e:
+                        logger.warning(f"Could not determine protected columns: {e}")
+                
+                # Also protect common identifier columns as fallback
+                for common_identifier in ["parcelid", "address"]:
+                    col_index = header_map.get(common_identifier, -1)
+                    if col_index >= 0:
+                        protected_columns.add(col_index)
+
                 # Group updates to minimize API calls
                 columns_to_update = {}
 
@@ -959,6 +1079,10 @@ class SheetsManager:
                 for field, value in data.items():
                     try:
                         col_index = headers.index(field)
+                        # Skip protected columns (identifier columns)
+                        if col_index in protected_columns:
+                            logger.debug(f"Skipping protected column '{field}' (index {col_index}) - identifier columns are immutable")
+                            continue
                         columns_to_update[col_index] = value
                     except ValueError:
                         logger.warning(
@@ -1070,305 +1194,621 @@ class SheetsManager:
         return f"{sheet_name}!{column_ref}{row_index}"
 
     def batch_update_property_data(self, updates, sheet_name="LIENS"):
-        """Perform a batch update of multiple rows with property data."""
+        """Perform optimized batch update using column-based ranges instead of row-by-row."""
         try:
-            # Use batch size from property settings
-            batch_size = self.config.BATCH_SIZE
-
+            # ADD THIS DEBUG LOGGING
+            logger.info(f"*** BATCH_UPDATE_ENTRY: {len(updates)} updates, sheet={sheet_name}")
+            logger.info(f"*** BATCH_SIZE_CONFIG: {self.config.BATCH_SIZE}")
+            
+            # Filter out header row updates
             updates = [
                 (idx, data) for idx, data in updates if idx + 2 > 1
-            ]  # +2 accounts for 0-indexed to 1-indexed and header row
+            ]
+            
             if len(updates) == 0:
-                logger.warning(
-                    "All updates filtered out to protect headers, nothing to do"
-                )
+                logger.warning("All updates filtered out to protect headers, nothing to do")
                 return
 
-            # If updates list is too large, recursively split it
+            # ADD THIS DEBUG LOGGING
+            logger.info(f"*** AFTER_FILTERING: {len(updates)} updates remain")
+
+            # For very large batches, split recursively using the same logic as before
+            batch_size = self.config.BATCH_SIZE
             if len(updates) > batch_size:
-                logger.info(
-                    f"Property batch size {len(updates)} exceeds configured size {batch_size}, splitting into smaller batches"
-                )
+                logger.info(f"*** RECURSIVE_SPLIT: {len(updates)} > {batch_size}, splitting")
                 midpoint = len(updates) // 2
-                first_half = updates[:midpoint]
-                second_half = updates[midpoint:]
-
+                
                 # Process first half
-                logger.info(
-                    f"Processing first half property batch ({len(first_half)} items)"
-                )
-                try:
-                    self.batch_update_property_data(first_half, sheet_name)
-                except Exception as e:
-                    logger.error(f"Error processing first half property batch: {e}")
-                    # If the batch is still large, reduce further
-                    if len(first_half) > 10:
-                        logger.info("Further reducing first half property batch size")
-                        for i in range(0, len(first_half), 10):
-                            mini_batch = first_half[i : i + 10]
-                            try:
-                                logger.info(
-                                    f"Processing property mini-batch of {len(mini_batch)} items"
-                                )
-                                self.batch_update_property_data(mini_batch, sheet_name)
-                                time.sleep(3)  # Add delay between mini-batches
-                            except Exception as mini_e:
-                                logger.error(f"Error in property mini-batch: {mini_e}")
-                    else:
-                        # If batch is already small, re-raise exception
-                        raise
-
-                # Add delay between halves
-                time.sleep(10)  # Longer delay for property data
-
-                # Process second half
-                logger.info(
-                    f"Processing second half property batch ({len(second_half)} items)"
-                )
-                try:
-                    self.batch_update_property_data(second_half, sheet_name)
-                except Exception as e:
-                    logger.error(f"Error processing second half property batch: {e}")
-                    # If the batch is still large, reduce further
-                    if len(second_half) > 10:
-                        logger.info("Further reducing second half property batch size")
-                        for i in range(0, len(second_half), 10):
-                            mini_batch = second_half[i : i + 10]
-                            try:
-                                logger.info(
-                                    f"Processing property mini-batch of {len(mini_batch)} items"
-                                )
-                                self.batch_update_property_data(mini_batch, sheet_name)
-                                time.sleep(3)  # Add delay between mini-batches
-                            except Exception as mini_e:
-                                logger.error(f"Error in property mini-batch: {mini_e}")
-                    else:
-                        # If batch is already small, re-raise exception
-                        raise
+                logger.info(f"*** PROCESSING_FIRST_HALF: {len(updates[:midpoint])} updates")
+                self.batch_update_property_data(updates[:midpoint], sheet_name)
+                time.sleep(2)
+                
+                # Process second half  
+                logger.info(f"*** PROCESSING_SECOND_HALF: {len(updates[midpoint:])} updates")
+                self.batch_update_property_data(updates[midpoint:], sheet_name)
                 return
 
-            # Get headers using the caching method
-            headers = self._get_sheet_headers(sheet_name)
+            logger.info(f"Optimizing batch update for {len(updates)} rows using column-based approach")
 
-            # Create case-insensitive header map
+            # Get headers and create header map
+            headers = self._get_sheet_headers(sheet_name)
             header_map = self._get_header_map(headers)
 
             # Find Status column index
             status_col_index = header_map.get("status", -1)
-
-            # If no status column found, raise exception
             if status_col_index == -1:
                 raise ValueError("Status column not found in headers")
+            
+            # Determine protected columns (identifier columns that should never be overwritten)
+            protected_columns = set()
+            if hasattr(self.config, '_current_county'):
+                try:
+                    county_config = self.config.get_county_config(self.config._current_county)
+                    identifier_col_index = header_map.get(county_config.identifier_column.lower(), -1)
+                    if identifier_col_index >= 0:
+                        protected_columns.add(identifier_col_index)
+                        logger.info(f"Protecting identifier column '{county_config.identifier_column}' (index {identifier_col_index}) from being overwritten")
+                except Exception as e:
+                    logger.warning(f"Could not determine protected columns: {e}")
+            
+            # Also protect common identifier columns as fallback
+            for common_identifier in ["parcelid", "address"]:
+                col_index = header_map.get(common_identifier, -1)
+                if col_index >= 0:
+                    protected_columns.add(col_index)
+                    logger.debug(f"Protecting common identifier column '{common_identifier}' (index {col_index})")
 
-            status_col_letter = self.col_num_to_letter(status_col_index)
-
-            # Prepare batch updates
-            batch_data = {"valueInputOption": "RAW", "data": []}
-
-            # Process each row update (this should already be in the loop)
+            # PHASE 1: Collect all data into organized structure
+            row_data_matrix = {}  # row_index -> {col_index: value}
+            status_updates = {}   # row_index -> status_value
+            
             for row_index, property_data in updates:
-                # Ensure we're never updating row 1 (headers)
-                sheet_row_index = (
-                    row_index + 2
-                )  # +1 for 1-based indexing, +1 to skip header row
-
-                # Now use sheet_row_index to create the status range for this specific row
-                status_range = self.format_range(
-                    sheet_name, status_col_letter, sheet_row_index
-                )
-
-                # Add the update to the batch
-                batch_data["data"].append(
-                    {"range": status_range, "values": [["Success"]]}
-                )
-
-                if property_data.get("success", False) and "data" in property_data:
-                    # Successful data fetch - update data fields
-                    data = property_data.get("data", {})
-
-                    # Find columns to update - map field names to column indices
-                    columns_to_update = {}
-
-                    for field, value in data.items():
-                        # Find column using case-insensitive match
-                        col_index = header_map.get(field.lower(), -1)
-                        if col_index >= 0:
-                            columns_to_update[col_index] = value
-                        else:
-                            logger.warning(
-                                f"Field '{field}' not found in headers, skipping"
-                            )
-
-                    # Only add data updates if we have data to update
-                    if columns_to_update:
-                        # Group columns for more efficient updates
-                        col_indices = sorted(columns_to_update.keys())
-
-                        # Create batched updates by column groups
-                        start_col = col_indices[0]
-                        current_group = [start_col]
-                        last_col = start_col
-
-                        for idx in col_indices[1:]:
-                            if idx == last_col + 1:
-                                # Continue group
-                                current_group.append(idx)
+                sheet_row_index = row_index + 2  # Convert to sheet row (1-based + header)
+                
+                # Handle status column
+                if property_data.get("success", False):
+                    status_updates[sheet_row_index] = "Success"
+                    
+                    # Handle data columns
+                    if "data" in property_data:
+                        row_data_matrix[sheet_row_index] = {}
+                        data = property_data.get("data", {})
+                        
+                        for field, value in data.items():
+                            col_index = header_map.get(field.lower(), -1)
+                            if col_index >= 0:
+                                # Skip protected columns (identifier columns)
+                                if col_index in protected_columns:
+                                    logger.debug(f"Skipping protected column '{field}' (index {col_index}) - identifier columns are immutable")
+                                    continue
+                                row_data_matrix[sheet_row_index][col_index] = value
                             else:
-                                # End current group and start a new one
-                                start_col_letter = self.col_num_to_letter(
-                                    current_group[0]
-                                )
-                                end_col_letter = self.col_num_to_letter(
-                                    current_group[-1]
-                                )
-
-                                # Create range and values
-                                values = [
-                                    columns_to_update[i]
-                                    if i in columns_to_update
-                                    else ""
-                                    for i in range(
-                                        current_group[0], current_group[-1] + 1
-                                    )
-                                ]
-
-                                range_name = self.format_range(
-                                    sheet_name,
-                                    f"{start_col_letter}:{end_col_letter}",
-                                    sheet_row_index,
-                                )
-
-                                batch_data["data"].append(
-                                    {"range": range_name, "values": [values]}
-                                )
-
-                                # Start new group
-                                current_group = [idx]
-
-                            last_col = idx
-
-                        # Add the last group
-                        if current_group:
-                            start_col_letter = self.col_num_to_letter(current_group[0])
-                            end_col_letter = self.col_num_to_letter(current_group[-1])
-
-                            values = [
-                                columns_to_update[i] if i in columns_to_update else ""
-                                for i in range(current_group[0], current_group[-1] + 1)
-                            ]
-
-                            range_name = self.format_range(
-                                sheet_name,
-                                f"{start_col_letter}:{end_col_letter}",
-                                sheet_row_index,
-                            )
-
-                            batch_data["data"].append(
-                                {"range": range_name, "values": [values]}
-                            )
+                                logger.debug(f"Field '{field}' not found in headers, skipping")
                 else:
-                    # Failed to get data - create a data dictionary with "Status" field
+                    # Failed data - just update status with error message
                     error_message = property_data.get("message", "Error")
-                    batch_data["data"].append(
-                        {"range": status_range, "values": [[error_message]]}
-                    )
+                    status_updates[sheet_row_index] = error_message
 
-            # Execute the batch update if there's data
-            if batch_data["data"]:
-                logger.info(
-                    f"Executing property batch update for {len(batch_data['data'])} ranges"
+            # PHASE 2: Create optimized ranges
+            batch_data = {"valueInputOption": "RAW", "data": []}
+            
+            # Handle status column updates (single column range for all rows)
+            if status_updates:
+                status_rows = sorted(status_updates.keys())
+                if len(status_rows) > 1 and self._are_consecutive_rows(status_rows):
+                    # Create single range for consecutive rows
+                    start_row = status_rows[0]
+                    end_row = status_rows[-1]
+                    status_col_letter = self.col_num_to_letter(status_col_index)
+                    
+                    range_name = f"{sheet_name}!{status_col_letter}{start_row}:{status_col_letter}{end_row}"
+                    values = [[status_updates[row]] for row in status_rows]
+                    
+                    batch_data["data"].append({
+                        "range": range_name,
+                        "values": values
+                    })
+                    logger.debug(f"Created status range: {range_name} ({len(values)} rows)")
+                else:
+                    # Create individual status updates for non-consecutive rows
+                    for row_index, status_value in status_updates.items():
+                        status_col_letter = self.col_num_to_letter(status_col_index)
+                        range_name = f"{sheet_name}!{status_col_letter}{row_index}"
+                        batch_data["data"].append({
+                            "range": range_name,
+                            "values": [[status_value]]
+                        })
+
+            # Handle data column updates (column-based optimization)
+            if row_data_matrix:
+                column_ranges = self._create_optimized_column_ranges(
+                    row_data_matrix, sheet_name, headers
                 )
+                batch_data["data"].extend(column_ranges)
 
-                max_retries = 5  # Maximum retry attempts
-
-                # Use exponential backoff for rate limits and connection issues
+            # PHASE 3: Execute optimized batch
+            if batch_data["data"]:
+                logger.info(f"Executing optimized batch: {len(batch_data['data'])} ranges for {len(updates)} rows")
+                
+                max_retries = 5
                 for retry in range(max_retries):
                     try:
-                        # Use exponential backoff with jitter
                         if retry > 0:
                             wait_time = min(60, (2**retry) + random.random())
-                            logger.info(
-                                f"Property retry {retry + 1}/{max_retries}: Waiting {wait_time:.2f} seconds before retry"
-                            )
+                            logger.info(f"Retry {retry + 1}/{max_retries}: Waiting {wait_time:.2f}s")
                             time.sleep(wait_time)
 
-                        if self.tcp_manager:
-                            try:
-                                # Define the batch update function
-                                def execute_batch():
-                                    return (
-                                        self.service.spreadsheets()
-                                        .values()
-                                        .batchUpdate(
-                                            spreadsheetId=self.spreadsheet_id,
-                                            body=batch_data,
-                                        )
-                                        .execute()
-                                    )
-
-                                # Execute with optimized retry logic
-                                return self.tcp_manager.execute_batch_with_retry(
-                                    self.service, execute_batch
-                                )
-                            except Exception as e:
-                                logger.error(
-                                    f"Failed to execute batch update after multiple retries: {e}"
-                                )
-                                raise
-                        else:
-                            self.service.spreadsheets().values().batchUpdate(
+                        # Execute the batch update
+                        response = (
+                            self.service.spreadsheets()
+                            .values()
+                            .batchUpdate(
                                 spreadsheetId=self.spreadsheet_id,
                                 body=batch_data,
-                            ).execute()
-
+                            )
+                            .execute()
+                        )
+                        
                         logger.info("Property batch update successful")
-                        time.sleep(3)  # Delay after successful batch
-                        return
-                    except (
-                        ConnectionAbortedError,
-                        ConnectionResetError,
-                        ConnectionError,
-                    ) as e:
-                        logger.warning(
-                            f"Connection error during property batch update (retry {retry + 1}/{max_retries}): {e}"
-                        )
+                        return response
 
-                        if retry == max_retries - 1:  # Last retry failed
-                            logger.error(
-                                "Maximum retries reached for property batch update."
-                            )
-                            raise
-
-                        # Reduce request size on connection errors by slicing the batch data
-                        if len(batch_data["data"]) > 10:
-                            logger.info(
-                                f"Reducing property batch size from {len(batch_data['data'])} to 10 for next retry"
-                            )
-                            # Only keep the first items for the next retry
-                            batch_data["data"] = batch_data["data"][:10]
-                    except HttpError as e:
-                        if e.resp.status == 429:  # Rate limit error
-                            wait_time = min(60, (2**retry) + random.random())
-                            logger.warning(
-                                f"Rate limit exceeded. Waiting {wait_time:.2f}s before property retry {retry + 1}/{max_retries}"
-                            )
-                            time.sleep(wait_time)
-                            if retry == max_retries - 1:  # Last retry failed
-                                logger.error(
-                                    "Maximum retries reached for property batch update."
-                                )
-                                raise
-                        else:
-                            logger.error(
-                                f"HTTP error during property batch update: {e}"
-                            )
-                            raise
                     except Exception as e:
-                        logger.error(
-                            f"Unexpected error during property batch update: {e}"
-                        )
-                        raise
+                        logger.error(f"Batch update attempt {retry + 1} failed: {e}")
+                        if retry == max_retries - 1:
+                            raise
+                
+            else:
+                logger.warning("No data to update in batch")
 
         except Exception as e:
-            logger.error(f"Error performing batch update for property data: {e}")
+            logger.error(f"Error performing batch update: {e}")
             raise
+
+    def _are_consecutive_rows(self, row_list):
+        """Check if row numbers are consecutive."""
+        if len(row_list) <= 1:
+            return True
+        
+        for i in range(1, len(row_list)):
+            if row_list[i] != row_list[i-1] + 1:
+                return False
+        return True
+
+    def _create_optimized_column_ranges(self, row_data_matrix, sheet_name, headers):
+        """Create optimized column ranges from row data matrix."""
+        ranges = []
+        
+        # Group data by columns
+        column_data = {}  # col_index -> {row_index: value}
+        
+        for row_index, row_columns in row_data_matrix.items():
+            for col_index, value in row_columns.items():
+                if col_index not in column_data:
+                    column_data[col_index] = {}
+                column_data[col_index][row_index] = value
+        
+        # Create ranges for each column
+        for col_index, row_values in column_data.items():
+            col_letter = self.col_num_to_letter(col_index)
+            sorted_rows = sorted(row_values.keys())
+            
+            if len(sorted_rows) > 1 and self._are_consecutive_rows(sorted_rows):
+                # Consecutive rows - create single range
+                start_row = sorted_rows[0]
+                end_row = sorted_rows[-1]
+                range_name = f"{sheet_name}!{col_letter}{start_row}:{col_letter}{end_row}"
+                
+                values = [[row_values[row]] for row in sorted_rows]
+                ranges.append({
+                    "range": range_name,
+                    "values": values
+                })
+                logger.debug(f"Created column range: {range_name} ({len(values)} rows)")
+            else:
+                # Non-consecutive rows - individual updates
+                for row_index, value in row_values.items():
+                    range_name = f"{sheet_name}!{col_letter}{row_index}"
+                    ranges.append({
+                        "range": range_name,
+                        "values": [[value]]
+                    })
+
+        return ranges
+
+    # ============== NJ-specific methods ==============
+
+    def get_nj_property_identifiers(
+        self,
+        sheet_name: str,
+        block_column: str = "Block",
+        lot_column: str = "Lot",
+        qual_column: Optional[str] = "Qual",
+        start_row: int = 2,
+        stop_row: int = 100,
+        force_reprocess: bool = False,
+    ) -> List[tuple]:
+        """
+        Get NJ property identifiers (Block/Lot/Qual) from sheet.
+
+        Args:
+            sheet_name: Name of the sheet to read from
+            block_column: Column header for Block numbers
+            lot_column: Column header for Lot numbers
+            qual_column: Column header for Qualifiers (optional)
+            start_row: First row to process (1-indexed)
+            stop_row: Last row to process
+            force_reprocess: If True, process even if Status='Success'
+
+        Returns:
+            List of (row_index, block, lot, qual) tuples
+        """
+        try:
+            # Get headers
+            headers = self._get_sheet_headers(sheet_name)
+            header_map = self._get_header_map(headers)
+
+            # Find column indices
+            block_col_index = header_map.get(block_column.lower(), -1)
+            lot_col_index = header_map.get(lot_column.lower(), -1)
+            qual_col_index = header_map.get(qual_column.lower(), -1) if qual_column else -1
+            status_col_index = header_map.get("status", -1)
+
+            if block_col_index == -1:
+                raise ValueError(f"Block column '{block_column}' not found in headers")
+            if lot_col_index == -1:
+                raise ValueError(f"Lot column '{lot_column}' not found in headers")
+
+            logger.info(f"Found columns - Block: {block_col_index}, Lot: {lot_col_index}, Qual: {qual_col_index}, Status: {status_col_index}")
+
+            # Check sheet dimensions
+            max_rows, _ = self._get_sheet_dimensions(sheet_name)
+            if stop_row > max_rows:
+                logger.warning(f"Requested stop_row {stop_row} exceeds sheet size {max_rows}, adjusting")
+                stop_row = max_rows
+
+            logger.info(f"Reading NJ identifiers from rows {start_row} to {stop_row}")
+
+            # Get status values first to filter out already processed rows
+            rows_to_process = []
+
+            if status_col_index >= 0:
+                status_col_letter = self.col_num_to_letter(status_col_index)
+                status_range = f"{sheet_name}!{status_col_letter}{start_row}:{status_col_letter}{stop_row}"
+
+                status_result = (
+                    self.service.spreadsheets()
+                    .values()
+                    .get(spreadsheetId=self.spreadsheet_id, range=status_range)
+                    .execute()
+                )
+
+                status_values = status_result.get("values", [])
+
+                # Build list of rows to process
+                for i in range(stop_row - start_row + 1):
+                    row_num = start_row + i
+                    status = ""
+                    if i < len(status_values) and status_values[i]:
+                        status = str(status_values[i][0]).strip().lower()
+
+                    # Skip if already successful (unless force_reprocess)
+                    if status == "success" and not force_reprocess:
+                        logger.debug(f"Skipping row {row_num} - already successful")
+                        continue
+
+                    rows_to_process.append(row_num)
+            else:
+                # No status column - process all rows
+                rows_to_process = list(range(start_row, stop_row + 1))
+
+            logger.info(f"Found {len(rows_to_process)} rows to process")
+
+            if not rows_to_process:
+                return []
+
+            # Fetch Block/Lot/Qual values in batches
+            identifier_data = []
+            batch_size = 100
+
+            for i in range(0, len(rows_to_process), batch_size):
+                batch = rows_to_process[i:i + batch_size]
+                batch_ranges = []
+
+                for row in batch:
+                    # Add Block column
+                    block_letter = self.col_num_to_letter(block_col_index)
+                    batch_ranges.append(f"{sheet_name}!{block_letter}{row}")
+
+                    # Add Lot column
+                    lot_letter = self.col_num_to_letter(lot_col_index)
+                    batch_ranges.append(f"{sheet_name}!{lot_letter}{row}")
+
+                    # Add Qual column if exists
+                    if qual_col_index >= 0:
+                        qual_letter = self.col_num_to_letter(qual_col_index)
+                        batch_ranges.append(f"{sheet_name}!{qual_letter}{row}")
+
+                result = self._execute_batch_get_with_retry(batch_ranges, f"NJ identifiers batch {i // batch_size + 1}")
+
+                if not result:
+                    continue
+
+                value_ranges = result.get("valueRanges", [])
+                cols_per_row = 3 if qual_col_index >= 0 else 2
+
+                for j in range(len(batch)):
+                    base_idx = j * cols_per_row
+
+                    if base_idx >= len(value_ranges):
+                        continue
+
+                    # Extract Block
+                    block_range = value_ranges[base_idx]
+                    block_vals = block_range.get("values", [[]])[0]
+                    block = str(block_vals[0]).strip() if block_vals else ""
+
+                    # Extract Lot
+                    lot_range = value_ranges[base_idx + 1]
+                    lot_vals = lot_range.get("values", [[]])[0]
+                    lot = str(lot_vals[0]).strip() if lot_vals else ""
+
+                    # Extract Qual (if available)
+                    qual = None
+                    if qual_col_index >= 0 and base_idx + 2 < len(value_ranges):
+                        qual_range = value_ranges[base_idx + 2]
+                        qual_vals = qual_range.get("values", [[]])[0]
+                        qual = str(qual_vals[0]).strip() if qual_vals else None
+
+                    # Only add if we have Block and Lot
+                    if block and lot:
+                        row_index = batch[j] - 2  # Convert to 0-indexed
+                        identifier_data.append((row_index, block, lot, qual))
+
+            logger.info(f"Retrieved {len(identifier_data)} NJ identifiers from {sheet_name}")
+            return identifier_data
+
+        except Exception as e:
+            logger.error(f"Error getting NJ property identifiers: {e}")
+            raise
+
+    def batch_update_nj_property_data(self, updates, sheet_name: str = "LIENS"):
+        """
+        Batch update NJ property data to sheet.
+
+        Args:
+            updates: List of (row_index, property_data) tuples
+            sheet_name: Name of the sheet to update
+        """
+        try:
+            # Import NJ field mapping
+            from nj_property_api import NJ_FIELD_MAPPING
+
+            if not updates:
+                logger.warning("No updates to process")
+                return
+
+            # Filter out header row
+            updates = [(idx, data) for idx, data in updates if idx + 2 > 1]
+
+            if not updates:
+                return
+
+            # Handle large batches by splitting
+            batch_size = self.config.BATCH_SIZE if hasattr(self.config, 'BATCH_SIZE') else 100
+            if len(updates) > batch_size:
+                logger.info(f"Splitting {len(updates)} updates into smaller batches")
+                midpoint = len(updates) // 2
+                self.batch_update_nj_property_data(updates[:midpoint], sheet_name)
+                time.sleep(2)
+                self.batch_update_nj_property_data(updates[midpoint:], sheet_name)
+                return
+
+            # Get headers
+            headers = self._get_sheet_headers(sheet_name)
+            header_map = self._get_header_map(headers)
+
+            # Determine which NJ fields we need columns for
+            # Note: Owner is excluded (always null due to privacy/Daniel's Law)
+            # Status is placed last for better readability
+            nj_output_fields = [
+                "Address", "TotalAssessed", "LandValue", "ImprovementValue",
+                "YearBuilt", "Acreage", "PropertyClass", "BuildingDesc",
+                "VacantLot", "SalePrice", "DeedDate", "MailingAddress",
+                "MailingCityState", "ZipCode", "Municipality", "County",
+                "PAMS_PIN", "Status"
+            ]
+
+            # Check which fields are missing from the sheet
+            missing_fields = []
+            for field in nj_output_fields:
+                if field.lower() not in header_map:
+                    missing_fields.append(field)
+
+            # Auto-create missing columns
+            if missing_fields:
+                logger.info(f"Sheet '{sheet_name}' is missing {len(missing_fields)} NJ columns: {missing_fields}")
+                logger.info("Auto-creating missing columns...")
+
+                # Add new headers starting after existing columns
+                new_col_start = len(headers)
+                total_cols_needed = new_col_start + len(missing_fields)
+
+                # First, expand the sheet if needed
+                try:
+                    # Get sheet metadata to find sheet ID and current dimensions
+                    spreadsheet_meta = self.service.spreadsheets().get(
+                        spreadsheetId=self.spreadsheet_id,
+                        fields="sheets(properties(sheetId,title,gridProperties))"
+                    ).execute()
+
+                    sheet_id = None
+                    current_max_cols = 26  # Default
+
+                    for sheet in spreadsheet_meta.get("sheets", []):
+                        if sheet["properties"]["title"] == sheet_name:
+                            sheet_id = sheet["properties"]["sheetId"]
+                            current_max_cols = sheet["properties"]["gridProperties"].get("columnCount", 26)
+                            break
+
+                    if sheet_id is not None and total_cols_needed > current_max_cols:
+                        # Expand the sheet columns
+                        logger.info(f"Expanding sheet from {current_max_cols} to {total_cols_needed} columns")
+                        expand_request = {
+                            "requests": [{
+                                "updateSheetProperties": {
+                                    "properties": {
+                                        "sheetId": sheet_id,
+                                        "gridProperties": {
+                                            "columnCount": total_cols_needed
+                                        }
+                                    },
+                                    "fields": "gridProperties.columnCount"
+                                }
+                            }]
+                        }
+                        self.service.spreadsheets().batchUpdate(
+                            spreadsheetId=self.spreadsheet_id,
+                            body=expand_request
+                        ).execute()
+                        logger.info(f"Sheet expanded to {total_cols_needed} columns")
+
+                except Exception as e:
+                    logger.error(f"Failed to expand sheet columns: {e}")
+                    # Continue anyway - may still work if columns exist
+
+                # Now add the new headers
+                new_headers_data = []
+                for i, field in enumerate(missing_fields):
+                    col_letter = self.col_num_to_letter(new_col_start + i)
+                    new_headers_data.append({
+                        "range": f"{sheet_name}!{col_letter}1",
+                        "values": [[field]]
+                    })
+
+                # Batch update the new headers
+                if new_headers_data:
+                    try:
+                        self.service.spreadsheets().values().batchUpdate(
+                            spreadsheetId=self.spreadsheet_id,
+                            body={"valueInputOption": "RAW", "data": new_headers_data}
+                        ).execute()
+                        logger.info(f"Created {len(missing_fields)} new columns: {missing_fields}")
+
+                        # Clear header cache and refresh
+                        cache_key = f"{self.spreadsheet_id}:{sheet_name}"
+                        if cache_key in self._headers_cache:
+                            del self._headers_cache[cache_key]
+
+                        # Re-fetch headers
+                        headers = self._get_sheet_headers(sheet_name)
+                        header_map = self._get_header_map(headers)
+
+                    except Exception as e:
+                        logger.error(f"Failed to create missing columns: {e}")
+                        # Continue anyway - will just skip fields without columns
+
+            # Find Status column (may have just been created)
+            status_col_index = header_map.get("status", -1)
+            if status_col_index < 0:
+                logger.warning("No 'Status' column found in sheet - status updates will be skipped")
+
+            # Protected columns (Block, Lot, Qual should not be overwritten)
+            protected_columns = set()
+            for col_name in ["block", "lot", "qual"]:
+                col_idx = header_map.get(col_name, -1)
+                if col_idx >= 0:
+                    protected_columns.add(col_idx)
+
+            # Prepare batch data
+            batch_data = {"valueInputOption": "RAW", "data": []}
+
+            for row_index, property_data in updates:
+                sheet_row_index = row_index + 2
+
+                if property_data.get("success", False) and "data" in property_data:
+                    data = property_data.get("data", {})
+
+                    # Map NJ fields to columns
+                    for field_name, value in data.items():
+                        col_index = header_map.get(field_name.lower(), -1)
+
+                        if col_index < 0:
+                            # Try to find by NJ field mapping
+                            for output_name, api_field in NJ_FIELD_MAPPING.items():
+                                if output_name.lower() == field_name.lower():
+                                    col_index = header_map.get(output_name.lower(), -1)
+                                    break
+
+                        if col_index >= 0 and col_index not in protected_columns:
+                            col_letter = self.col_num_to_letter(col_index)
+                            range_name = f"{sheet_name}!{col_letter}{sheet_row_index}"
+                            batch_data["data"].append({
+                                "range": range_name,
+                                "values": [[value if value is not None else ""]]
+                            })
+
+                    # Update Status to Success
+                    if status_col_index >= 0:
+                        status_letter = self.col_num_to_letter(status_col_index)
+                        range_name = f"{sheet_name}!{status_letter}{sheet_row_index}"
+                        batch_data["data"].append({
+                            "range": range_name,
+                            "values": [["Success"]]
+                        })
+                else:
+                    # Update Status with error message
+                    if status_col_index >= 0:
+                        error_msg = property_data.get("message", "Error")
+                        status_letter = self.col_num_to_letter(status_col_index)
+                        range_name = f"{sheet_name}!{status_letter}{sheet_row_index}"
+                        batch_data["data"].append({
+                            "range": range_name,
+                            "values": [[error_msg]]
+                        })
+
+            # Execute batch update
+            if batch_data["data"]:
+                logger.info(f"Executing NJ batch update: {len(batch_data['data'])} ranges")
+
+                for retry in range(5):
+                    try:
+                        if retry > 0:
+                            wait_time = min(60, (2 ** retry) + random.random())
+                            time.sleep(wait_time)
+
+                        self.service.spreadsheets().values().batchUpdate(
+                            spreadsheetId=self.spreadsheet_id,
+                            body=batch_data,
+                        ).execute()
+
+                        logger.info("NJ batch update successful")
+                        return
+
+                    except HttpError as e:
+                        if e.resp.status == 429:
+                            logger.warning(f"Rate limit, retry {retry + 1}/5")
+                            if retry == 4:
+                                raise
+                        else:
+                            raise
+
+        except Exception as e:
+            logger.error(f"Error in NJ batch update: {e}")
+            raise
+
+    def update_row_with_nj_property_data(
+        self, row_index: int, property_data: Dict[str, Any], sheet_name: str = "LIENS"
+    ) -> None:
+        """
+        Update a single row with NJ property data (fallback for batch failures).
+
+        Args:
+            row_index: 0-based index of the row to update
+            property_data: Dictionary with property data result
+            sheet_name: Name of the sheet to update
+        """
+        try:
+            # Use batch method with single item
+            self.batch_update_nj_property_data([(row_index, property_data)], sheet_name)
+        except Exception as e:
+            logger.error(f"Error updating NJ row {row_index + 2}: {e}")

@@ -11,6 +11,7 @@ from scraper import WaterBillScraper
 from utils.cache_manager import CacheManager
 from utils.minimal_cache_manager import MinimalCacheManager
 import math
+from collections import defaultdict
 
 logger = logging.getLogger("routes")
 
@@ -40,17 +41,12 @@ async def process_addresses_for_bill_details(
     cache_manager = cache_manager or CacheManager()
 
     logger.info(f"Starting water bill processing for sheet: {sheet_name}")
-    logger.info(
-        f"Processing rows from {config.START_ROW} to "
-        + (
-            f"{config.STOP_ROW}"
-            if config.STOP_ROW > 0
-            else f"{config.START_ROW + config.MAX_ROWS - 1}"
-        )
-    )
+    if hasattr(config, '_stop_row_was_set') and config._stop_row_was_set:
+        actual_stop_row = config.STOP_ROW
+    else:
+        actual_stop_row = config.START_ROW + config.MAX_ROWS - 1
 
-    if config.SKIP_ROW_RANGE:
-        logger.info(f"Skipping rows: {config.SKIP_ROW_RANGE}")
+    logger.info(f"Processing rows from {config.START_ROW} to {actual_stop_row}")
 
     # Use the provided sheets_manager or create a new one
     sheets = sheets_manager or SheetsManager(config)
@@ -350,15 +346,25 @@ async def process_addresses_for_bill_details(
     # Clear all water bill cache files after successful processing
     if cache_manager:
         logger.info("Processing complete - clearing water bill cache")
-        file_count = 0
-        for filename in os.listdir(cache_manager.cache_dir):
-            if filename.startswith("water_bill_") and filename.endswith(".json"):
-                try:
-                    os.remove(os.path.join(cache_manager.cache_dir, filename))
-                    file_count += 1
-                except Exception as e:
-                    logger.error(f"Error removing cache file {filename}: {e}")
-        logger.info(f"Removed {file_count} water bill cache files")
+        try:
+            # Check if it's Redis cache manager or file cache manager
+            if hasattr(cache_manager, 'cache_dir'):
+                # File-based cache (MinimalCacheManager)
+                file_count = 0
+                for filename in os.listdir(cache_manager.cache_dir):
+                    if filename.startswith("water_bill_") and filename.endswith(".json"):
+                        try:
+                            os.remove(os.path.join(cache_manager.cache_dir, filename))
+                            file_count += 1
+                        except Exception as e:
+                            logger.error(f"Error removing cache file {filename}: {e}")
+                logger.info(f"Removed {file_count} water bill cache files")
+            else:
+                # Redis cache (RedisCacheManager)
+                cache_manager.clear_cache("water_bill")
+                logger.info("Cleared water bill cache from Redis")
+        except Exception as e:
+            logger.error(f"Error clearing water bill cache: {e}")
 
     return {
         "results": results,
@@ -376,9 +382,24 @@ def process_county_property_data(
     delay_seconds: Optional[float] = None
 ) -> dict:  # Return a result dictionary
     """Process property data for a specific county."""
+    
+    import time
+    import threading
+    current_time = time.time()
+    thread_id = threading.get_ident()
+    logger.error(f"*** FUNCTION_ENTRY: process_county_property_data called at {current_time}")
+    logger.error(f"*** THREAD_ID: {thread_id}")
+    logger.error(f"*** JOB_ID: {job_id}")
+    logger.error(f"*** COUNTY: {county_name}")
+
+    total_start_time = time.time()
+    logger.info(f"=== TIMING: Starting {county_name} processing for {config.MAX_ROWS} rows ===")
+    logger.info(f"process_county_property_data called with county_name={county_name}")
 
     # Initialize stats dictionary
-    stats = {"total": 0, "processed": 0, "success": 0, "error": 0, "cache_hits": 0, "api_calls": 0}
+    #stats = {"total": 0, "processed": 0, "success": 0, "error": 0, "cache_hits": 0, "api_calls": 0}
+    stats_lock = threading.Lock()
+    stats = defaultdict(int)
     
     # Set the current county
     config.set_current_county(county_name)
@@ -403,19 +424,28 @@ def process_county_property_data(
 
     try:
         # Get identifiers with their row indices using unified method
+        sheet_read_start = time.time()
         identifier_data = sheets.get_property_identifiers(
             config, sheet_name, county_config
         )
+        sheet_read_time = time.time() - sheet_read_start
+        logger.info(f"=== TIMING: Sheet read took {sheet_read_time:.2f} seconds for {len(identifier_data) if identifier_data else 0} rows ===")
     except Exception as e:
-        logger.error(
-            f"Failed to get {county_config.identifier_type} from sheet {sheet_name}: {e}"
-        )
-        return
+        logger.error(f"Failed to get {county_config.identifier_type} from sheet {sheet_name}: {e}")
+        if job_id and job_store:
+            job_store.update_job_progress(
+                job_id=job_id,
+                progress=0,
+                status="failed",
+                message=f"Sheet error: {str(e)}"
+            )
+        return {"results": [], "stats": {"error": 1, "total": 0}}
     if not identifier_data:
         logger.warning(
             f"No {county_config.identifier_type} found in sheet: {sheet_name}"
         )
         return
+    
     stats["total"] = len(identifier_data)
     logger.info(f"Processing with MAX_ROWS={config.MAX_ROWS}")
 
@@ -431,17 +461,12 @@ def process_county_property_data(
     )
 
     # Pass both config objects to SheetsManager
-    logger.info(
-        f"Processing rows from {config.START_ROW} to "
-        + (
-            f"{config.STOP_ROW}"
-            if config.STOP_ROW > 0
-            else f"{config.START_ROW + config.MAX_ROWS - 1}"
-        )
-    )
+    if hasattr(config, '_stop_row_was_set') and config._stop_row_was_set:
+        actual_stop_row = config.STOP_ROW
+    else:
+        actual_stop_row = config.START_ROW + config.MAX_ROWS - 1
 
-    if config.SKIP_ROW_RANGE:
-        logger.info(f"Skipping rows: {config.SKIP_ROW_RANGE}")
+    logger.info(f"Processing rows from {config.START_ROW} to {actual_stop_row}")
 
     logger.info(
         f"Processing {len(identifier_data)} {county_config.identifier_type}s using {config.MAX_WORKERS} "
@@ -506,7 +531,7 @@ def process_county_property_data(
                 logger.error(f"Failed to update results batch from cache: {e}")
 
     # Initialize the property API client with county configuration
-    property_api = PropertyDataAPI(config=config, county=county_config.county_name)
+    property_api = PropertyDataAPI(county_config.county_name, config=config)
     results = []
 
     # Start timing
@@ -516,16 +541,16 @@ def process_county_property_data(
     identifiers_to_process = []
     processed_indices = {idx for idx, _ in pending_updates}
 
-    for idx, identifier in identifier_data:
+    for idx, identifier, row_optional_params in identifier_data:
         if idx not in processed_indices:
-            identifiers_to_process.append((idx, identifier))
+            identifiers_to_process.append((idx, identifier, row_optional_params))
 
     logger.info(
         f"Processing {len(identifiers_to_process)} {county_config.identifier_type}s after filtering out cached results"
     )
 
     # Define robust process_identifier function with built-in retries
-    def process_identifier(row_idx, identifier):
+    def process_identifier(row_idx, identifier, row_optional_params):
         if not identifier:
             return row_idx, None
 
@@ -537,13 +562,16 @@ def process_county_property_data(
 
         try:
             # Get property data
-            stats["api_calls"] += 1
-            result = property_api.get_property_data(identifier)
+            with stats_lock:
+                stats["api_calls"] += 1
+            
+            result = property_api.get_property_data(identifier, optional_params=row_optional_params)
 
-            if result.get("success", False):
-                stats["success"] += 1
-            else:
-                stats["error"] += 1
+            with stats_lock:
+                if result.get("success", False):
+                    stats["success"] += 1
+                else:
+                    stats["error"] += 1
 
             # Cache the result
             if cache_manager and result:
@@ -556,8 +584,9 @@ def process_county_property_data(
 
             return row_idx, result
 
-        except Exception:
+        except Exception as e:
             stats["error"] += 1
+            logger.exception(f"DETAILED ERROR for row {row_idx + 2}, identifier={identifier}, optional_params={row_optional_params}: {e}")
             logger.error(
                 f"Error processing {county_config.identifier_type} (row {row_idx + 2})"
             )
@@ -565,8 +594,8 @@ def process_county_property_data(
             # Create error result without logging the actual exception
             error_result = {
                 "success": False,
-                "message": f"Error processing {county_config.identifier_type}",
-                "data": {"Status": "Error"},
+                "message": f"Error: {str(e)}",  # This is what shows in Status column
+                "data": {"Status": f"Error: {str(e)}"},
             }
 
             # Cache the error result
@@ -577,13 +606,15 @@ def process_county_property_data(
             return row_idx, error_result
 
     # Process identifiers in parallel
+    api_calls_start = time.time()
+    logger.info(f"=== TIMING: Starting API calls for {len(identifiers_to_process)} identifiers with {config.MAX_WORKERS} workers ===")
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=config.MAX_WORKERS
     ) as executor:
         # Submit all jobs
         future_to_idx = {
-            executor.submit(process_identifier, idx, identifier): idx
-            for idx, identifier in identifiers_to_process
+            executor.submit(process_identifier, idx, identifier, row_optional_params): idx
+            for idx, identifier, row_optional_params in identifiers_to_process
             if identifier
         }
         # Process results as they complete
@@ -621,6 +652,11 @@ def process_county_property_data(
                 logger.error(f"Worker thread error: {e}")
                 completed += 1  # Still count errors towards progress
 
+    api_calls_end = time.time()
+    api_calls_duration = api_calls_end - api_calls_start
+    logger.info(f"=== TIMING: API calls completed in {api_calls_duration:.2f} seconds ===")
+    logger.info(f"=== TIMING: Average time per row: {api_calls_duration / len(identifiers_to_process):.2f} seconds ===")
+
     # Sort results by index to maintain order
     results.sort(key=lambda x: x[0])
 
@@ -648,6 +684,8 @@ def process_county_property_data(
     # Update the sheet in batches
     batch_count = (len(results) + config.BATCH_SIZE - 1) // config.BATCH_SIZE
     logger.info(f"Starting updates for {len(results)} records in {batch_count} batches")
+    logger.info(f"=== TIMING: Starting Google Sheets batch updates for {len(results)} results ===")
+    sheets_update_start = time.time()
     for i in range(0, len(results), config.BATCH_SIZE):
         batch = results[i : i + config.BATCH_SIZE]
         batch_num = i // config.BATCH_SIZE + 1
@@ -736,6 +774,14 @@ def process_county_property_data(
                         logger.error(f"Failed to update row {idx + 2}: {inner_e}")
                         # Cache entry remains for next run
 
+    sheets_update_end = time.time()
+    sheets_update_duration = sheets_update_end - sheets_update_start
+    total_duration = time.time() - total_start_time
+
+    logger.info(f"=== TIMING: Google Sheets updates completed in {sheets_update_duration:.2f} seconds ===")
+    logger.info(f"=== TIMING: TOTAL PROCESSING TIME: {total_duration:.2f} seconds for {len(results)} rows ===")
+    logger.info(f"=== TIMING: Breakdown - Sheets read: {sheet_read_time:.2f}s, API calls: {api_calls_duration:.2f}s, Sheets update: {sheets_update_duration:.2f}s ===")
+
     # Calculate and log timing information
     total_time = time.time() - start_time
     logger.info(
@@ -753,17 +799,29 @@ def process_county_property_data(
         logger.info(
             f"Processing complete - clearing {county_config.county_name} property cache"
         )
-        file_count = 0
-        for filename in os.listdir(cache_manager.cache_dir):
-            if filename.startswith(f"{cache_key}_") and filename.endswith(".json"):
-                try:
-                    os.remove(os.path.join(cache_manager.cache_dir, filename))
-                    file_count += 1
-                except Exception as e:
-                    logger.error(f"Error removing cache file {filename}: {e}")
-        logger.info(
-            f"Removed {file_count} {county_config.county_name} property cache files"
-        )
+        try:
+            # Check if it's Redis cache manager or file cache manager
+            if hasattr(cache_manager, 'cache_dir'):
+                # File-based cache (MinimalCacheManager)
+                file_count = 0
+                for filename in os.listdir(cache_manager.cache_dir):
+                    if filename.startswith(f"{cache_key}_") and filename.endswith(".json"):
+                        try:
+                            os.remove(os.path.join(cache_manager.cache_dir, filename))
+                            file_count += 1
+                        except Exception as e:
+                            logger.error(f"Error removing cache file {filename}: {e}")
+                logger.info(
+                    f"Removed {file_count} {county_config.county_name} property cache files"
+                )
+            else:
+                # Redis cache (RedisCacheManager)
+                cache_manager.clear_cache(cache_key)
+                logger.info(
+                    f"Cleared {county_config.county_name} property cache from Redis"
+                )
+        except Exception as e:
+            logger.error(f"Error clearing cache: {e}")
 
     if job_id and job_store:
         job_store.update_job_progress(

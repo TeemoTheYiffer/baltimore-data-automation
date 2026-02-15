@@ -17,8 +17,20 @@ build:
     - gcloud config set project $GCP_PROJECT_ID
   script:
     - cd src
-    - gcloud builds submit --tag "${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA}"
-    # Also tag as latest for easy reference
+    # Submit build async to avoid log-streaming permission issues
+    - BUILD_ID=$(gcloud builds submit --tag "${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA}" --async --format='value(id)')
+    - echo "Build started - ID $BUILD_ID"
+    # Poll until build completes
+    - |
+      while true; do
+        STATUS=$(gcloud builds describe "$BUILD_ID" --format='value(status)')
+        case "$STATUS" in
+          SUCCESS) echo "Build succeeded"; break ;;
+          FAILURE|TIMEOUT|CANCELLED|EXPIRED) echo "Build failed: $STATUS"; exit 1 ;;
+          *) echo "Status: $STATUS - waiting..."; sleep 15 ;;
+        esac
+      done
+    # Tag as latest for easy reference
     - gcloud container images add-tag "${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA}" "${IMAGE_NAME}:latest" --quiet
   rules:
     - if: $CI_COMMIT_BRANCH == "main"

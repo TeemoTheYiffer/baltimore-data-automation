@@ -31,60 +31,70 @@ class PropertyDataAPI:
 
     def _make_request_with_retry(self, url: str, description: str) -> Optional[List[Dict]]:
         """
-        Make HTTP request with retry logic for 500 errors.
-        
+        Make HTTP request with retry logic for 500 and 403 errors.
+
         Args:
             url: The URL to request
             description: Description for logging (e.g., "primary query", "fallback query")
-            
+
         Returns:
             JSON response data or None if all retries failed
         """
         import time
         import random
-        
-        max_retries = 3
+
+        max_retries = 5  # Increased retries for rate limiting
+        retryable_codes = {500, 403, 429}  # Server error, Forbidden (rate limit), Too Many Requests
+
         for attempt in range(max_retries):
             try:
                 logger.debug(f"Attempting {description} (attempt {attempt + 1}): {url}")
-                
+
                 response = self.session.get(url, timeout=self.config.REQUEST_TIMEOUT)
-                
-                if response.status_code == 500:
+
+                if response.status_code in retryable_codes:
                     if attempt < max_retries - 1:
-                        wait_time = (2 ** attempt) + random.uniform(0.1, 0.5)  # Exponential backoff with jitter
-                        logger.warning(f"500 error on {description}, retrying in {wait_time:.2f}s (attempt {attempt + 1}/{max_retries})")
+                        # Longer backoff for rate limiting (403/429)
+                        if response.status_code in {403, 429}:
+                            wait_time = (3 ** attempt) + random.uniform(1.0, 3.0)  # Longer backoff for rate limits
+                        else:
+                            wait_time = (2 ** attempt) + random.uniform(0.1, 0.5)
+                        logger.warning(f"{response.status_code} error on {description}, retrying in {wait_time:.2f}s (attempt {attempt + 1}/{max_retries})")
                         time.sleep(wait_time)
                         continue
                     else:
-                        logger.error(f"500 error persists on {description} after {max_retries} attempts")
+                        logger.error(f"{response.status_code} error persists on {description} after {max_retries} attempts")
                         return None
-                
+
                 response.raise_for_status()
                 data = response.json()
-                
+
                 if attempt > 0:
                     logger.info(f"Successfully retrieved {description} after {attempt + 1} attempts")
-                
+
                 return data
-                
+
             except requests.exceptions.HTTPError as e:
-                if e.response.status_code == 500 and attempt < max_retries - 1:
-                    wait_time = (2 ** attempt) + random.uniform(0.1, 0.5)
-                    logger.warning(f"HTTP 500 error on {description}, retrying in {wait_time:.2f}s")
+                status_code = e.response.status_code if hasattr(e, 'response') and e.response else None
+                if status_code in retryable_codes and attempt < max_retries - 1:
+                    if status_code in {403, 429}:
+                        wait_time = (3 ** attempt) + random.uniform(1.0, 3.0)
+                    else:
+                        wait_time = (2 ** attempt) + random.uniform(0.1, 0.5)
+                    logger.warning(f"HTTP {status_code} error on {description}, retrying in {wait_time:.2f}s")
                     time.sleep(wait_time)
                     continue
                 else:
                     logger.error(f"HTTP error on {description}: {e}")
                     if attempt == max_retries - 1:
                         return None
-                    raise  # Re-raise for non-500 errors
+                    raise  # Re-raise for non-retryable errors
             except Exception as e:
                 logger.error(f"Request error on {description}: {e}")
                 if attempt == max_retries - 1:
                     return None
                 raise
-        
+
         return None
 
     def _map_optional_params_to_api_fields(self, optional_params: Optional[Dict[str, str]] = None) -> Dict[str, str]:

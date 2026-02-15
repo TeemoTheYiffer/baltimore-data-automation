@@ -84,7 +84,7 @@ class AppConfig(BaseSettings):
     IMPERSONATED_USER: Optional[str] = None
 
     # Processing settings
-    REQUEST_DELAY: float = 0.3
+    REQUEST_DELAY: float = 0.5  # Increased from 0.3 to help avoid rate limiting
     BATCH_SIZE: int = 100
 
     # Water bill settings

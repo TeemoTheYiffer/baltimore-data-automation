@@ -20,32 +20,21 @@ The CI/CD pipeline needs a service account with permissions to build images and 
 
 ```bash
 # Create the service account
-gcloud iam service-accounts create gitlab-ci-deployer \
-  --display-name="GitLab CI/CD Deployer" \
-  --project=parabolic-clock-457218-f5
+gcloud iam service-accounts create gitlab-ci-deployer --display-name="GitLab CI/CD Deployer" --project=parabolic-clock-457218-f5
 
 # Grant required roles
 SA_EMAIL="gitlab-ci-deployer@parabolic-clock-457218-f5.iam.gserviceaccount.com"
 
-gcloud projects add-iam-policy-binding parabolic-clock-457218-f5 \
-  --member="serviceAccount:${SA_EMAIL}" \
-  --role="roles/cloudbuild.builds.editor"
+gcloud projects add-iam-policy-binding parabolic-clock-457218-f5 --member="serviceAccount:${$SA_EMAIL}" --role="roles/cloudbuild.builds.editor"
 
-gcloud projects add-iam-policy-binding parabolic-clock-457218-f5 \
-  --member="serviceAccount:${SA_EMAIL}" \
-  --role="roles/run.admin"
+gcloud projects add-iam-policy-binding parabolic-clock-457218-f5 --member="serviceAccount:${SA_EMAIL}" --role="roles/run.admin"
 
-gcloud projects add-iam-policy-binding parabolic-clock-457218-f5 \
-  --member="serviceAccount:${SA_EMAIL}" \
-  --role="roles/storage.admin"
+gcloud projects add-iam-policy-binding parabolic-clock-457218-f5 --member="serviceAccount:${SA_EMAIL}" --role="roles/storage.admin"
 
-gcloud projects add-iam-policy-binding parabolic-clock-457218-f5 \
-  --member="serviceAccount:${SA_EMAIL}" \
-  --role="roles/iam.serviceAccountUser"
+gcloud projects add-iam-policy-binding parabolic-clock-457218-f5 --member="serviceAccount:${SA_EMAIL}" --role="roles/iam.serviceAccountUser"
 
 # Generate the key
-gcloud iam service-accounts keys create sa-key.json \
-  --iam-account="${SA_EMAIL}"
+gcloud iam service-accounts keys create sa-key.json --iam-account="${SA_EMAIL}"
 ```
 
 ### 2. Add the Key to GitLab

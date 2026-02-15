@@ -13,16 +13,13 @@ build:
   stage: build
   image: google/cloud-sdk:slim
   before_script:
-    - echo "$GCP_SA_KEY" > /tmp/sa-key.json
-    - gcloud auth activate-service-account --key-file=/tmp/sa-key.json
+    - gcloud auth activate-service-account --key-file="$GCP_SA_KEY"
     - gcloud config set project $GCP_PROJECT_ID
   script:
     - cd src
     - gcloud builds submit --tag "${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA}"
     # Also tag as latest for easy reference
     - gcloud container images add-tag "${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA}" "${IMAGE_NAME}:latest" --quiet
-  after_script:
-    - rm -f /tmp/sa-key.json
   rules:
     - if: $CI_COMMIT_BRANCH == "main"
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
@@ -32,8 +29,7 @@ deploy-production:
   stage: deploy
   image: google/cloud-sdk:slim
   before_script:
-    - echo "$GCP_SA_KEY" > /tmp/sa-key.json
-    - gcloud auth activate-service-account --key-file=/tmp/sa-key.json
+    - gcloud auth activate-service-account --key-file="$GCP_SA_KEY"
     - gcloud config set project $GCP_PROJECT_ID
   script:
     - |
@@ -52,8 +48,6 @@ deploy-production:
         --execution-environment gen2
     - echo "Deployed to production"
     - gcloud run services describe "${SERVICE_NAME}" --region="${GCP_REGION}" --format="value(status.url)"
-  after_script:
-    - rm -f /tmp/sa-key.json
   rules:
     - if: $CI_COMMIT_BRANCH == "main"
   environment:
@@ -65,8 +59,7 @@ deploy-staging:
   stage: deploy
   image: google/cloud-sdk:slim
   before_script:
-    - echo "$GCP_SA_KEY" > /tmp/sa-key.json
-    - gcloud auth activate-service-account --key-file=/tmp/sa-key.json
+    - gcloud auth activate-service-account --key-file="$GCP_SA_KEY"
     - gcloud config set project $GCP_PROJECT_ID
   script:
     - |
@@ -85,8 +78,6 @@ deploy-staging:
         --execution-environment gen2
     - echo "Deployed to staging"
     - gcloud run services describe "${SERVICE_NAME}-staging" --region="${GCP_REGION}" --format="value(status.url)"
-  after_script:
-    - rm -f /tmp/sa-key.json
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
   environment:

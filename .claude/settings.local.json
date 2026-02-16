@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "Bash(find:*)",
+      "WebFetch(domain:www.zillionforms.com)",
+      "WebFetch(domain:services2.arcgis.com)",
+      "WebFetch(domain:opendata.maryland.gov)"
     ]
   }
 }

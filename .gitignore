@@ -149,3 +149,4 @@ files.txt
 src/.claude/settings.local.json
 .gitignore
 CLAUDE.md
+.claude

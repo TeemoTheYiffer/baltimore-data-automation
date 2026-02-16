@@ -13,6 +13,7 @@ class CountyEnum(str, Enum):
     """Enum for supported counties."""
 
     BALTIMORE = "baltimore"
+    BALTIMORE_CITY = "baltimore_city"
     PG = "pg"
     FREDERICK = "frederick"
     MONTGOMERY = "montgomery"  
@@ -97,7 +98,8 @@ class AppConfig(BaseSettings):
 
     # Property settings (Use '$limit=5' to limit data and $where=record_key_account_number_sdat_field_3 LIKE "" to search ParcelIDs)
     PROPERTY_SHEET_NAME: str = "LIENS"
-    BALTIMORE_URL: str = "https://opendata.maryland.gov/resource/jpfc-qkxp.json" #CITY: "https://opendata.maryland.gov/resource/3x3p-xk2v.json"
+    BALTIMORE_URL: str = "https://opendata.maryland.gov/resource/jpfc-qkxp.json"  # Baltimore County
+    BALTIMORE_CITY_URL: str = "https://opendata.maryland.gov/resource/3x3p-xk2v.json"  # Baltimore City
     PG_URL: str = "https://opendata.maryland.gov/resource/w3eb-4mzd.json"
     FREDERICK_URL: str = "https://opendata.maryland.gov/resource/gx8c-a963.json"
     MONTGOMERY_URL: str = "https://opendata.maryland.gov/resource/kb22-is2w.json"
@@ -161,6 +163,14 @@ class AppConfig(BaseSettings):
             "baltimore": CountyConfig(
                 county_name="baltimore",
                 base_url=self.BALTIMORE_URL,
+                identifier_type="address",
+                identifier_column="ADDRESS",
+                field_mapping=self.FIELD_MAPPING,
+                spreadsheet_id=None,
+            ),
+            "baltimore_city": CountyConfig(
+                county_name="baltimore_city",
+                base_url=self.BALTIMORE_CITY_URL,
                 identifier_type="address",
                 identifier_column="ADDRESS",
                 field_mapping=self.FIELD_MAPPING,
@@ -298,7 +308,9 @@ class AppConfig(BaseSettings):
         # Handle aliases for county names
         if county_name in ["prince_george", "prince georges", "pg_county"]:
             county_name = "pg"
-        elif county_name in ["baltimore_city", "baltimore city"]:
+        elif county_name in ["baltimore city"]:
+            county_name = "baltimore_city"
+        elif county_name in ["baltimore_county", "baltimore county"]:
             county_name = "baltimore"
 
         if county_name not in self.COUNTY_CONFIGS:

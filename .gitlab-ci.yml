@@ -17,6 +17,20 @@ build:
     - gcloud config set project $GCP_PROJECT_ID
   script:
     - cd src
+    # Inject app_secrets (gitignored, not in repo)
+    - mkdir -p app_secrets
+    - touch app_secrets/__init__.py
+    - cp "$GCP_APP_CREDENTIALS" app_secrets/parabolic-clock-457218-f5-886e8be4f217.json
+    - |
+      cat > app_secrets/google_credentials.py <<'PYEOF'
+      SERVICE_ACCOUNT_FILE = 'app_secrets/parabolic-clock-457218-f5-886e8be4f217.json'
+      CLIENT_ID = None
+      CLIENT_SECRET = None
+      API_KEY = None
+      CLIENT_SECRETS_FILE = None
+      IMPERSONATED_USER = None
+      PYEOF
+    - sed -i 's/^      //' app_secrets/google_credentials.py
     # Submit build async to avoid log-streaming permission issues
     - BUILD_ID=$(gcloud builds submit --tag "${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA}" --async --format='value(id)')
     - echo "Build started - ID $BUILD_ID"
@@ -79,7 +93,7 @@ deploy-staging:
         --image "${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA}" \
         --platform managed \
         --region "${GCP_REGION}" \
-        --allow-unauthenticated \
+        --no-allow-unauthenticated \
         --timeout "1800" \
         --max-instances "1" \
         --min-instances "0" \

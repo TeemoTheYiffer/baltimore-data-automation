@@ -83,8 +83,8 @@ deploy-staging:
         --timeout "1800" \
         --max-instances "1" \
         --min-instances "0" \
-        --cpu "4" \
-        --memory "8Gi" \
+        --cpu "8" \
+        --memory "16Gi" \
         --concurrency "10" \
         --cpu-boost \
         --execution-environment gen2

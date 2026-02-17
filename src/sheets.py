@@ -119,9 +119,9 @@ class SheetsManager:
         raise RuntimeError("Failed to fetch sheet headers after multiple retries")
     
     def _execute_batch_get_with_retry(self, batch_ranges: List[str], batch_name: str) -> Optional[Dict]:
-        """Execute batchGet with basic retry for rate limits and connection errors."""
-        max_retries = 3
-        
+        """Execute batchGet with retry for rate limits and connection errors."""
+        max_retries = 4
+
         for attempt in range(max_retries):
             try:
                 result = (
@@ -130,26 +130,27 @@ class SheetsManager:
                     .batchGet(spreadsheetId=self.spreadsheet_id, ranges=batch_ranges)
                     .execute()
                 )
-                
+
                 if attempt > 0:
                     logger.info(f"Successfully retrieved {batch_name} after {attempt + 1} attempts")
-                
+
                 return result
-                
+
             except HttpError as e:
                 if e.resp.status == 429:  # Rate limit error
-                    wait_time = (2 ** attempt) + random.random()
-                    logger.warning(f"Rate limit, waiting {wait_time:.2f}s before retry {attempt + 1}")
-                    time.sleep(wait_time)
                     if attempt == max_retries - 1:
                         raise
+                    # Per-minute quota: wait 60+ seconds for the window to reset
+                    wait_time = 65 + random.uniform(0, 10.0)
+                    logger.warning(f"Rate limit hit on {batch_name}, waiting {wait_time:.0f}s for quota reset (retry {attempt + 1}/{max_retries})")
+                    time.sleep(wait_time)
                 else:
                     logger.error(f"HTTP error in {batch_name}: {e}")
                     raise
             except Exception as e:
                 logger.error(f"Error in {batch_name}: {e}")
                 raise
-        
+
         return None
 
     def _get_sheet_dimensions(self, sheet_name: str) -> tuple[int, int]:
@@ -252,17 +253,15 @@ class SheetsManager:
 
             logger.info(f"Fetching property data from row {start_row} to {end_row} (sheet has {max_sheet_rows} rows)")
 
-            # Get the status values
+            # Get the status values (with retry and chunking for large ranges)
             status_col_letter = self.col_num_to_letter(status_col_index)
-            status_range = f"{sheet_name}!{status_col_letter}{start_row}:{status_col_letter}{end_row}"
-            status_result = (
-                self.service.spreadsheets()
-                .values()
-                .get(spreadsheetId=self.spreadsheet_id, range=status_range)
-                .execute()
-            )
+            status_range = [f"{sheet_name}!{status_col_letter}{start_row}:{status_col_letter}{end_row}"]
+            status_result = self._execute_batch_get_with_retry(status_range, "status column fetch")
 
-            status_values = status_result.get("values", [])
+            if status_result and status_result.get("valueRanges"):
+                status_values = status_result["valueRanges"][0].get("values", [])
+            else:
+                status_values = []
             logger.info(f"Retrieved {len(status_values)} status values")
 
             # Parse skip ranges from PROPERTY settings
@@ -309,86 +308,132 @@ class SheetsManager:
 
             logger.info(f"Found {len(rows_to_process)} rows that need processing")
 
-            # Now only fetch the identifiers for rows that need processing
+            # Fetch all needed columns in bulk (1 API call instead of N/100)
             identifier_col_letter = self.col_num_to_letter(identifier_col_index)
             identifier_data = []
 
-            # Process in smaller batches to avoid large API calls
-            columns_per_row = 1 + len(optional_param_columns)
-            max_ranges_per_call = 200  # Google's limit
-            batch_size = min(100, max_ranges_per_call // columns_per_row)
-            logger.info(f"Using batch size {batch_size} for {columns_per_row} columns per row")
-            for i in range(0, len(rows_to_process), batch_size):
-                batch = rows_to_process[i : i + batch_size]
-                batch_ranges = []
-                for row in batch:
-                    # Add identifier column
-                    batch_ranges.append(f"{sheet_name}!{identifier_col_letter}{row}")
-                    
-                    # Add optional parameter columns
-                    for column_name, col_index in optional_param_columns.items():
-                        col_letter = self.col_num_to_letter(col_index)
-                        batch_ranges.append(f"{sheet_name}!{col_letter}{row}")
+            # Build ranges for entire columns at once
+            bulk_ranges = [f"{sheet_name}!{identifier_col_letter}{start_row}:{identifier_col_letter}{end_row}"]
+            optional_param_order = []  # Track order for parsing
+            for column_name, col_index in optional_param_columns.items():
+                col_letter = self.col_num_to_letter(col_index)
+                bulk_ranges.append(f"{sheet_name}!{col_letter}{start_row}:{col_letter}{end_row}")
+                optional_param_order.append(column_name)
 
-                if not batch_ranges:
-                    continue
+            total_rows = end_row - start_row + 1
+            CHUNK_SIZE = 5000  # Max rows per API call to avoid timeouts
 
-                # Get identifiers for this batch
-                result = self._execute_batch_get_with_retry(
-                    batch_ranges, f"batch {i//batch_size + 1}"
-                )
-                
-                if not result:  # Skip this batch if it failed completely
-                    logger.warning(f"Skipping batch {i//batch_size + 1} due to range errors")
-                    continue
+            if total_rows <= CHUNK_SIZE:
+                # Small enough to fetch in one call
+                logger.info(f"Fetching {len(bulk_ranges)} column(s) in single API call for rows {start_row}-{end_row}")
+                result = self._execute_batch_get_with_retry(bulk_ranges, "bulk identifier fetch")
+
+                if not result:
+                    logger.warning("Failed to fetch identifiers in bulk")
+                    return identifier_data
 
                 value_ranges = result.get("valueRanges", [])
-                
-                # Calculate number of columns per row (1 identifier + N optional params)
-                columns_per_row = 1 + len(optional_param_columns)
+                identifier_values = value_ranges[0].get("values", []) if value_ranges else []
 
-                for j in range(len(batch)):
-                    if j * columns_per_row >= len(value_ranges):
+                optional_values = {}
+                for k, column_name in enumerate(optional_param_order):
+                    if k + 1 < len(value_ranges):
+                        optional_values[column_name] = value_ranges[k + 1].get("values", [])
+                    else:
+                        optional_values[column_name] = []
+            else:
+                # Chunk large reads to avoid timeouts
+                num_chunks = (total_rows + CHUNK_SIZE - 1) // CHUNK_SIZE
+                logger.info(f"Large range ({total_rows} rows) - splitting into {num_chunks} chunks of {CHUNK_SIZE}")
+
+                identifier_values = []
+                optional_values = {col_name: [] for col_name in optional_param_order}
+
+                for chunk_idx in range(num_chunks):
+                    chunk_start = start_row + (chunk_idx * CHUNK_SIZE)
+                    chunk_end = min(chunk_start + CHUNK_SIZE - 1, end_row)
+
+                    chunk_ranges = [f"{sheet_name}!{identifier_col_letter}{chunk_start}:{identifier_col_letter}{chunk_end}"]
+                    for column_name, col_index in optional_param_columns.items():
+                        col_letter = self.col_num_to_letter(col_index)
+                        chunk_ranges.append(f"{sheet_name}!{col_letter}{chunk_start}:{col_letter}{chunk_end}")
+
+                    logger.info(f"Fetching chunk {chunk_idx + 1}/{num_chunks}: rows {chunk_start}-{chunk_end}")
+                    chunk_result = self._execute_batch_get_with_retry(chunk_ranges, f"bulk identifier fetch chunk {chunk_idx + 1}")
+
+                    if not chunk_result:
+                        logger.warning(f"Failed to fetch chunk {chunk_idx + 1}, skipping")
+                        # Pad with empty values so row indices stay aligned
+                        rows_in_chunk = chunk_end - chunk_start + 1
+                        identifier_values.extend([[] for _ in range(rows_in_chunk)])
+                        for col_name in optional_param_order:
+                            optional_values[col_name].extend([[] for _ in range(rows_in_chunk)])
                         continue
-                        
-                    # Get identifier value
-                    identifier_range = value_ranges[j * columns_per_row]
-                    identifier_values = identifier_range.get("values", [[]])[0]
-                    identifier = identifier_values[0].strip() if identifier_values and identifier_values[0] else ""
-                    
-                    if not identifier:
-                        continue
-                    
-                    # Get optional parameter values for this row
-                    row_optional_params = {}
-                    for k, (column_name, field_mapping_key) in enumerate(optional_param_mapping.items()):
-                        param_range_index = j * columns_per_row + 1 + k
-                        if param_range_index < len(value_ranges):
-                            param_range = value_ranges[param_range_index]
-                            param_values = param_range.get("values", [[]])[0]
-                            param_value = param_values[0].strip() if param_values and param_values[0] else ""
-                            
-                            if not param_value:
-                                # Optional parameter is required if user specified it
-                                logger.warning(f"Row {rows_to_process[i + j]}: Missing required optional parameter '{column_name}'")
-                                # Skip this row entirely - treat missing optional param as missing identifier
-                                row_optional_params = None
-                                break
-                            
-                            row_optional_params[field_mapping_key] = param_value
-                            
-                    if row_optional_params:
-                        logger.debug(f"Row {rows_to_process[i + j]}: Found optional params: {row_optional_params}")
 
-                    # Only add if we have identifier and all required optional params
-                    if identifier and row_optional_params is not None:
-                        row_index = rows_to_process[i + j] - 2  # Convert to 0-indexed
-                        identifier_data.append((row_index, identifier, row_optional_params))
+                    chunk_value_ranges = chunk_result.get("valueRanges", [])
+                    chunk_identifiers = chunk_value_ranges[0].get("values", []) if chunk_value_ranges else []
 
-                    elif identifier and not optional_param_columns:
-                        # No optional params specified, use empty dict
-                        row_index = rows_to_process[i + j] - 2
-                        identifier_data.append((row_index, identifier, {}))
+                    # Pad to full chunk size if API returned fewer rows (trailing empty cells)
+                    rows_in_chunk = chunk_end - chunk_start + 1
+                    while len(chunk_identifiers) < rows_in_chunk:
+                        chunk_identifiers.append([])
+
+                    identifier_values.extend(chunk_identifiers)
+
+                    for k, column_name in enumerate(optional_param_order):
+                        if k + 1 < len(chunk_value_ranges):
+                            col_vals = chunk_value_ranges[k + 1].get("values", [])
+                        else:
+                            col_vals = []
+                        while len(col_vals) < rows_in_chunk:
+                            col_vals.append([])
+                        optional_values[column_name].extend(col_vals)
+
+                logger.info(f"Fetched all {num_chunks} chunks, total identifier values: {len(identifier_values)}")
+
+            # Convert rows_to_process to a set for fast lookup
+            rows_to_process_set = set(rows_to_process)
+
+            # Iterate through all rows and filter to ones needing processing
+            for i in range(end_row - start_row + 1):
+                actual_row = start_row + i
+
+                if actual_row not in rows_to_process_set:
+                    continue
+
+                # Get identifier value
+                identifier = ""
+                if i < len(identifier_values) and identifier_values[i]:
+                    identifier = identifier_values[i][0].strip() if identifier_values[i][0] else ""
+
+                if not identifier:
+                    continue
+
+                # Get optional parameter values for this row
+                row_optional_params = {}
+                skip_row = False
+                for column_name in optional_param_order:
+                    field_mapping_key = optional_param_mapping[column_name]
+                    col_values = optional_values.get(column_name, [])
+                    param_value = ""
+                    if i < len(col_values) and col_values[i]:
+                        param_value = col_values[i][0].strip() if col_values[i][0] else ""
+
+                    if not param_value:
+                        logger.warning(f"Row {actual_row}: Missing required optional parameter '{column_name}'")
+                        skip_row = True
+                        break
+
+                    row_optional_params[field_mapping_key] = param_value
+
+                if skip_row:
+                    continue
+
+                if row_optional_params:
+                    logger.debug(f"Row {actual_row}: Found optional params: {row_optional_params}")
+
+                row_index = actual_row - 2  # Convert to 0-indexed
+                identifier_data.append((row_index, identifier, row_optional_params))
 
             logger.info(
                 f"Retrieved {len(identifier_data)} identifiers from {sheet_name}"
@@ -847,15 +892,8 @@ class SheetsManager:
                 if not batch_ranges:
                     continue
 
-                # Get addresses for this batch
-                address_result = (
-                    self.service.spreadsheets()
-                    .values()
-                    .batchGet(
-                        spreadsheetId=self.spreadsheet_id, ranges=batch_ranges
-                    )
-                    .execute()
-                )
+                # Get addresses for this batch (with retry for rate limits)
+                address_result = self._execute_batch_get_with_retry(batch_ranges, f"addresses batch {i//batch_size + 1}")
 
                 value_ranges = address_result.get("valueRanges", [])
                 for j, value_range in enumerate(value_ranges):

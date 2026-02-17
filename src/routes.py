@@ -605,9 +605,49 @@ def process_county_property_data(
 
             return row_idx, error_result
 
-    # Process identifiers in parallel
+    # Process identifiers in parallel with streaming writes to Google Sheets
     api_calls_start = time.time()
-    logger.info(f"=== TIMING: Starting API calls for {len(identifiers_to_process)} identifiers with {config.MAX_WORKERS} workers ===")
+    FLUSH_SIZE = 50  # Write to sheet every N completed results
+    pending_batch = []  # Buffer for results awaiting sheet write
+    total_written = 0
+    sheets_update_duration = 0
+
+    def flush_to_sheet(batch_to_write):
+        """Write a batch of results to Google Sheets immediately."""
+        nonlocal total_written, sheets_update_duration
+        if not batch_to_write:
+            return
+        batch_to_write.sort(key=lambda x: x[0])  # Sort by row index
+        flush_start = time.time()
+        try:
+            sheets.batch_update_property_data(batch_to_write, sheet_name)
+            total_written += len(batch_to_write)
+            logger.info(f"Flushed {len(batch_to_write)} rows to sheet (total written: {total_written})")
+
+            # Remove from cache
+            if cache_manager:
+                for idx, result in batch_to_write:
+                    identifier = result.get("identifier") if result.get("success", False) else None
+                    if identifier:
+                        cache_manager.remove_from_cache(identifier, cache_key)
+                    else:
+                        cache_manager.remove_from_cache(f"row_{idx}", cache_key)
+        except HttpError as e:
+            if e.resp.status == 429:
+                logger.warning("Rate limit on sheet write. Waiting 65s for quota reset...")
+                time.sleep(65)
+                try:
+                    sheets.batch_update_property_data(batch_to_write, sheet_name)
+                    total_written += len(batch_to_write)
+                except Exception as retry_e:
+                    logger.error(f"Retry after quota reset failed: {retry_e}")
+            else:
+                logger.error(f"Failed to flush batch to sheet: {e}")
+        except Exception as e:
+            logger.error(f"Error flushing batch to sheet: {e}")
+        sheets_update_duration += time.time() - flush_start
+
+    logger.info(f"=== TIMING: Starting API calls for {len(identifiers_to_process)} identifiers with {config.MAX_WORKERS} workers (streaming writes every {FLUSH_SIZE} results) ===")
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=config.MAX_WORKERS
     ) as executor:
@@ -617,50 +657,55 @@ def process_county_property_data(
             for idx, identifier, row_optional_params in identifiers_to_process
             if identifier
         }
-        # Process results as they complete
         completed = 0
         total = len(future_to_idx)
         progress_interval = min(
             100, max(1, total // 10)
-        )  # Report at 10% intervals or every 100 items
+        )
 
-        # Process results as they complete
         for future in concurrent.futures.as_completed(future_to_idx):
             try:
                 idx, result = future.result()
-                if result:  # Skip None results (empty identifiers)
+                if result:
                     results.append((idx, result))
+                    pending_batch.append((idx, result))
 
                 completed += 1
+
+                # Flush to sheet when buffer is full
+                if len(pending_batch) >= FLUSH_SIZE:
+                    flush_to_sheet(pending_batch)
+                    pending_batch = []
+
                 if completed % progress_interval == 0 or completed == total:
                     logger.info(
-                        f"Progress: {completed}/{total} {county_config.identifier_type}s processed ({completed / total * 100:.1f}%)"
+                        f"Progress: {completed}/{total} {county_config.identifier_type}s processed ({completed / total * 100:.1f}%), {total_written} written to sheet"
                     )
-                    
-                    # Add job tracking update
                     if job_id and job_store:
-                        # Allocate 30% of progress to the main processing phase (45+5 to 80)
-                        processing_progress = 30 * (completed / total)
-                        current_progress = 50 + processing_progress  # Starting after cache processing
+                        processing_progress = 45 * (completed / total)
+                        current_progress = 50 + processing_progress
                         job_store.update_job_progress(
                             job_id=job_id,
                             progress=int(current_progress),
-                            message=f"Processing: {completed}/{total} {county_config.identifier_type}s ({completed / total * 100:.1f}%)"
+                            message=f"Processing: {completed}/{total} ({completed / total * 100:.1f}%) - {total_written} written"
                         )
 
             except Exception as e:
                 logger.error(f"Worker thread error: {e}")
-                completed += 1  # Still count errors towards progress
+                completed += 1
+
+    # Flush any remaining results
+    if pending_batch:
+        flush_to_sheet(pending_batch)
+        pending_batch = []
 
     api_calls_end = time.time()
     api_calls_duration = api_calls_end - api_calls_start
     logger.info(f"=== TIMING: API calls completed in {api_calls_duration:.2f} seconds ===")
-    logger.info(f"=== TIMING: Average time per row: {api_calls_duration / len(identifiers_to_process):.2f} seconds ===")
+    if identifiers_to_process:
+        logger.info(f"=== TIMING: Average time per row: {api_calls_duration / len(identifiers_to_process):.2f} seconds ===")
 
-    # Sort results by index to maintain order
-    results.sort(key=lambda x: x[0])
-
-    # After processing is complete, log the summary
+    # Log summary
     logger.info(f"Processing summary for {county_name} county:")
     logger.info(f"Total records: {stats['total']}")
     logger.info(
@@ -673,109 +718,15 @@ def process_county_property_data(
         f"Cache hits: {stats['cache_hits']} ({stats['cache_hits'] / stats['total'] * 100:.1f}%)"
     )
     logger.info(f"API calls made: {stats['api_calls']}")
+    logger.info(f"Total rows written to sheet: {total_written}")
 
     if job_id and job_store:
         job_store.update_job_progress(
             job_id=job_id,
-            progress=80,
-            message=f"Processing completed: {stats['success']} successful, {stats['error']} failed. Starting batch updates."
+            progress=95,
+            message=f"Completed: {stats['success']} successful, {stats['error']} failed. {total_written} rows written."
         )
 
-    # Update the sheet in batches
-    batch_count = (len(results) + config.BATCH_SIZE - 1) // config.BATCH_SIZE
-    logger.info(f"Starting updates for {len(results)} records in {batch_count} batches")
-    logger.info(f"=== TIMING: Starting Google Sheets batch updates for {len(results)} results ===")
-    sheets_update_start = time.time()
-    for i in range(0, len(results), config.BATCH_SIZE):
-        batch = results[i : i + config.BATCH_SIZE]
-        batch_num = i // config.BATCH_SIZE + 1
-        logger.info(
-            f"Processing batch {batch_num}/{batch_count} ({len(batch)} records)"
-        )
-        if job_id and job_store:
-            # Allocate 15% of progress to batch updates (80 to 95)
-            batch_progress = 15 * (batch_num / batch_count)
-            current_progress = 80 + batch_progress
-            job_store.update_job_progress(
-                job_id=job_id,
-                progress=int(current_progress),
-                message=f"Updating batch {batch_num}/{batch_count} for {county_name}"
-            )
-        try:
-            sheets.batch_update_property_data(batch, sheet_name)
-            logger.info(
-                f"Updated batch {i // config.BATCH_SIZE + 1} of "
-                + f"{(len(results) + config.BATCH_SIZE - 1) // config.BATCH_SIZE}"
-            )
-
-            # Remove successfully updated entries from cache
-            if cache_manager:
-                for idx, result in batch:
-                    # Get identifier from result
-                    identifier = None
-                    if result.get("success", False):
-                        identifier = result.get("identifier")
-
-                    if identifier:
-                        cache_manager.remove_from_cache(identifier, cache_key)
-                    else:
-                        # Use row index as fallback identifier
-                        cache_manager.remove_from_cache(f"row_{idx}", cache_key)
-
-            # Add substantial delay between batches to avoid hitting API limits
-            if i + config.BATCH_SIZE < len(results):  # Don't delay after the last batch
-                delay_time = config.DELAY_BETWEEN_BATCHES
-                logger.info(f"Sleeping for {delay_time} seconds before next batch")
-                time.sleep(delay_time)
-        except HttpError as e:
-            if e.resp.status == 429:  # Rate limit error
-                logger.warning(
-                    "Rate limit exceeded on batch. Waiting 60 seconds for quota reset..."
-                )
-                time.sleep(60)  # Wait a full minute for quota reset
-                try:
-                    sheets.batch_update_property_data(batch, sheet_name)
-
-                    # Remove from cache on success
-                    if cache_manager:
-                        for idx, result in batch:
-                            identifier = (
-                                result.get("identifier")
-                                if result.get("success", False)
-                                else None
-                            )
-                            if identifier:
-                                cache_manager.remove_from_cache(identifier, cache_key)
-                            else:
-                                cache_manager.remove_from_cache(f"row_{idx}", cache_key)
-                except Exception as retry_e:
-                    logger.error(f"Retry after quota reset failed: {retry_e}")
-                    # Cache entries remain for next run
-            else:
-                logger.error(f"Failed to update results batch: {e}")
-                # Attempt individual updates as fallback for non-rate-limit errors
-                for idx, result in batch:
-                    try:
-                        time.sleep(1)  # Add delay between individual requests
-                        sheets.update_row_with_property_data(idx, result, sheet_name)
-
-                        # Remove from cache on success
-                        if cache_manager:
-                            identifier = (
-                                result.get("identifier")
-                                if result.get("success", False)
-                                else None
-                            )
-                            if identifier:
-                                cache_manager.remove_from_cache(identifier, cache_key)
-                            else:
-                                cache_manager.remove_from_cache(f"row_{idx}", cache_key)
-                    except Exception as inner_e:
-                        logger.error(f"Failed to update row {idx + 2}: {inner_e}")
-                        # Cache entry remains for next run
-
-    sheets_update_end = time.time()
-    sheets_update_duration = sheets_update_end - sheets_update_start
     total_duration = time.time() - total_start_time
 
     logger.info(f"=== TIMING: Google Sheets updates completed in {sheets_update_duration:.2f} seconds ===")

@@ -34,7 +34,7 @@ class PropertyDataAPI:
             logger.warning("Socrata API: no API key configured — rate limits will be strict")
         
 
-    def _make_request_with_retry(self, url: str, description: str) -> Optional[List[Dict]]:
+    def _make_request_with_retry(self, url: str, description: str, timeout: int = None) -> Optional[List[Dict]]:
         """
         Make HTTP request with retry logic.
 
@@ -55,7 +55,7 @@ class PropertyDataAPI:
 
         for attempt in range(max_retries):
             try:
-                response = self.session.get(url, timeout=self.config.REQUEST_TIMEOUT)
+                response = self.session.get(url, timeout=timeout or self.config.REQUEST_TIMEOUT)
 
                 # 403: likely Socrata rate limiting — allow ONE retry with short delay
                 if response.status_code == 403:
@@ -259,7 +259,7 @@ class PropertyDataAPI:
                         return self.get_property_data(simplified)
                 
                 # Fallback 3: $q full-text search (for records with empty combined address field)
-                # Try with 0-3 leading zeros on the address number
+                # $q is slow (full-text scan) — only try 0 and 1 leading zero
                 if len(data) == 0 and self.county_config.identifier_type == "address":
                     _, address_number, street_name = parse_address(identifier)
                     if address_number:
@@ -267,17 +267,21 @@ class PropertyDataAPI:
                         parts = street_name.rsplit(" ", 1)
                         bare_street = parts[0] if len(parts) == 2 and parts[1].upper() in street_suffixes else street_name
 
-                        for zeros in range(4):  # try 0, 1, 2, 3 leading zeros
+                        for zeros in range(2):  # only 0 and 1 leading zero
                             padded_num = "0" * zeros + address_number
                             q_term = f"{padded_num} {bare_street}"
-                            q_url = f"{self.county_config.base_url}?$q={urllib.parse.quote(q_term)}&$limit=10"
+                            q_url = f"{self.county_config.base_url}?$q={urllib.parse.quote(q_term)}&$limit=5"
                             logger.info(f"Trying $q full-text search: '{q_term}'")
 
-                            q_data = self._make_request_with_retry(q_url, f"$q search '{q_term}'")
-                            if q_data and len(q_data) > 0:
-                                data = q_data
-                                logger.info(f"$q search found {len(data)} results for '{q_term}'")
-                                break
+                            try:
+                                q_data = self._make_request_with_retry(q_url, f"$q search '{q_term}'", timeout=60)
+                                if q_data and len(q_data) > 0:
+                                    data = q_data
+                                    logger.info(f"$q search found {len(data)} results for '{q_term}'")
+                                    break
+                            except Exception as q_err:
+                                logger.warning(f"$q search timed out for '{q_term}': {q_err}")
+                                break  # don't try more $q if it's timing out
                 
                 # For parcel_id counties - try alternative padding lengths
                 if len(data) == 0 and self.county_config.identifier_type == "parcel_id" and self.county_config.parcel_digits > 0:

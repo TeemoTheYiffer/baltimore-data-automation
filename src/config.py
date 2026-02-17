@@ -84,9 +84,9 @@ class AppConfig(BaseSettings):
     SERVICE_ACCOUNT_FILE: Optional[str] = None
     IMPERSONATED_USER: Optional[str] = None
 
-    # Socrata (Maryland Open Data) API credentials
-    MARYLAND_APP_TOKEN: Optional[str] = None
-    MARYLAND_APP_SECRET: Optional[str] = None
+    # Socrata (Maryland Open Data) API Key credentials (HTTP Basic Auth)
+    MARYLAND_APP_API_KEY_ID: Optional[str] = None
+    MARYLAND_APP_API_KEY_SECRET: Optional[str] = None
 
     # Processing settings
     REQUEST_DELAY: float = 0.5  # Delay per thread between API calls

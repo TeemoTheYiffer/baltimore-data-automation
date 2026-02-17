@@ -17,25 +17,26 @@ class PropertyDataAPI:
         self.county_config = self.config.get_county_config(county)
         self.session = requests.Session()
 
-        # Socrata API app token (higher rate limits — no Basic auth needed for reads)
-        app_token = self.config.MARYLAND_APP_TOKEN
+        # Socrata API Key authentication (HTTP Basic Auth)
+        api_key_id = self.config.MARYLAND_APP_API_KEY_ID
+        api_key_secret = self.config.MARYLAND_APP_API_KEY_SECRET
 
-        if app_token:
-            self.session.headers.update({
-                'X-App-Token': app_token,
-                'Accept': 'application/json',
-            })
-            logger.info("Socrata API: using app token for higher rate limits")
+        # Browser-like headers to avoid Cloudflare bot challenges
+        self.session.headers.update({
+            'Accept': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        })
+
+        if api_key_id and api_key_secret:
+            self.session.auth = (api_key_id, api_key_secret)
+            logger.info("Socrata API: using HTTP Basic Auth (API key) for authenticated rate limits")
         else:
-            self.session.headers.update({
-                'Accept': 'application/json',
-            })
-            logger.warning("Socrata API: no app token configured — rate limits will be strict")
+            logger.warning("Socrata API: no API key configured — rate limits will be strict")
         
 
     def _make_request_with_retry(self, url: str, description: str) -> Optional[List[Dict]]:
         """
-        Make HTTP request with retry logic for 500 and 403 errors.
+        Make HTTP request with retry logic.
 
         Args:
             url: The URL to request
@@ -49,14 +50,23 @@ class PropertyDataAPI:
 
         max_retries = 3
         retryable_codes = {500, 429}  # Only retry server errors and explicit rate limits
+        max_403_retries = 1  # Single retry for 403 (likely rate limit)
+        num_403_retries = 0
 
         for attempt in range(max_retries):
             try:
                 response = self.session.get(url, timeout=self.config.REQUEST_TIMEOUT)
 
-                # 403: don't retry — either auth issue or data doesn't exist
+                # 403: likely Socrata rate limiting — allow ONE retry with short delay
                 if response.status_code == 403:
-                    logger.info(f"403 on {description} — skipping (no data or access denied)")
+                    body_preview = response.text[:200] if response.text else "(empty)"
+                    if num_403_retries < max_403_retries:
+                        num_403_retries += 1
+                        wait_time = 3 + random.uniform(1.0, 3.0)
+                        logger.warning(f"403 on {description} — retrying once in {wait_time:.1f}s (body: {body_preview})")
+                        time.sleep(wait_time)
+                        continue
+                    logger.info(f"403 persisted on {description} — skipping (body: {body_preview})")
                     return []
 
                 if response.status_code in retryable_codes:
@@ -75,7 +85,14 @@ class PropertyDataAPI:
             except requests.exceptions.HTTPError as e:
                 status_code = e.response.status_code if hasattr(e, 'response') and e.response else None
                 if status_code == 403:
-                    logger.info(f"403 on {description} — skipping")
+                    body_preview = e.response.text[:200] if e.response and e.response.text else "(empty)"
+                    if num_403_retries < max_403_retries:
+                        num_403_retries += 1
+                        wait_time = 3 + random.uniform(1.0, 3.0)
+                        logger.warning(f"403 on {description} — retrying once in {wait_time:.1f}s (body: {body_preview})")
+                        time.sleep(wait_time)
+                        continue
+                    logger.info(f"403 persisted on {description} — skipping (body: {body_preview})")
                     return []
                 if status_code in retryable_codes and attempt < max_retries - 1:
                     wait_time = (2 ** attempt) + random.uniform(0.5, 2.0)
@@ -163,51 +180,32 @@ class PropertyDataAPI:
         return final_url
 
     def format_fallback_api_url(self, identifier: str, optional_params: Optional[Dict[str, str]] = None) -> str:
-        """Format the fallback API URL for a more flexible query."""
-        # Handle different identifier types based on county configuration
+        """Format the fallback API URL using the short field name to avoid Cloudflare WAF.
+
+        Cloudflare blocks queries with long Socrata field names (50+ chars).
+        Fallback uses mdp_street_address_mdp_field_address (works) with the
+        street type suffix stripped, e.g. '1534 ABBOTSTON%' instead of
+        '1534 ABBOTSTON ST%'.
+        """
         if self.county_config.identifier_type == "parcel_id":
-            # For PG County, just use a more flexible match on Parcel ID
             base_query = f"{self.county_config.base_url}?$where=record_key_account_number_sdat_field_3 LIKE '{urllib.parse.quote(identifier)}'"
         else:
-            # Parse the address into components for other counties
             _, address_number, street_name = parse_address(identifier)
 
-            # If we couldn't extract a number, try a direct search
             if not address_number:
                 base_query = f"{self.county_config.base_url}?$where=mdp_street_address_mdp_field_address LIKE '{urllib.parse.quote(identifier)}%25'"
             else:
-                # Try different number formats
-                number_formats = []
-
-                # Original number
-                number_formats.append(address_number)
-
-                # With leading zeros (try multiple variations)
-                for i in range(1, 5):  # Try up to 4 leading zeros
-                    number_formats.append(f"{'0' * i}{address_number}")
-
-                # Build query with OR conditions for multiple number formats
-                conditions = []
-                for num_format in number_formats:
-                    conditions.append(
-                        f"premise_address_number_mdp_field_premsnum_sdat_field_20='{num_format}'"
-                    )
-
-                number_condition = f"({' OR '.join(conditions)})"
-
-                # Try street name with AND without type suffix (ST, AVE, RD, etc.)
-                # Database may store "ABBOTSTON" instead of "ABBOTSTON ST"
+                # Strip street type suffix (ST, AVE, RD, etc.) for broader matching
                 street_suffixes = {"ST", "AVE", "RD", "DR", "LN", "CT", "PL", "BLVD", "WAY", "CIR", "TER", "PKY", "HWY", "SQ", "ALY"}
                 street_name_parts = street_name.rsplit(" ", 1)
-                street_variants = [urllib.parse.quote(street_name)]
                 if len(street_name_parts) == 2 and street_name_parts[1].upper() in street_suffixes:
-                    # Also try without the suffix
-                    street_variants.append(urllib.parse.quote(street_name_parts[0]))
+                    bare_street = street_name_parts[0]
+                else:
+                    bare_street = street_name
 
-                street_conditions = [f"premise_address_name_mdp_field_premsnam_sdat_field_23 LIKE '{v}'" for v in street_variants]
-                street_condition = f"({' OR '.join(street_conditions)})" if len(street_conditions) > 1 else street_conditions[0]
-
-                base_query = f"{self.county_config.base_url}?$where={number_condition} AND {street_condition}"
+                # Use short field name with wildcard: "1534 ABBOTSTON%"
+                fallback_address = f"{address_number} {bare_street}"
+                base_query = f"{self.county_config.base_url}?$where=mdp_street_address_mdp_field_address LIKE '{urllib.parse.quote(fallback_address)}%25'"
         
         # Add optional parameters if provided
         optional_clause = self._build_optional_params_clause(optional_params)
@@ -242,23 +240,44 @@ class PropertyDataAPI:
                 # Request failed after retries
                 return {"success": False, "message": f"API request failed for {original_identifier}"}
 
-            # If no results, try fallback approach
+            # If no results, try fallback approaches
             if len(data) == 0:
+                # Fallback 1: same short field, street suffix stripped (e.g. "1534 ABBOTSTON%")
                 fallback_url = self.format_fallback_api_url(identifier, optional_params)
-                logger.info(f"No results with primary query for {self.county_config.identifier_type}: {identifier}. Trying fallback query: {fallback_url}")
-                
-                data = self._make_request_with_retry(fallback_url, f"fallback query for {self.county_config.identifier_type} '{identifier}'")
-                
-                if data is None:
-                    # Fallback request failed after retries
-                    return {"success": False, "message": f"Fallback API request failed for {original_identifier}"}
+                logger.info(f"No results with primary query for {self.county_config.identifier_type}: {identifier}. Trying fallback: {fallback_url}")
 
-                # For address-based counties - try simplified address
+                data = self._make_request_with_retry(fallback_url, f"fallback query for '{identifier}'")
+
+                if data is None:
+                    return {"success": False, "message": f"Fallback API request failed for {original_identifier}"}
+                
+                # Fallback 2: simplified address
                 if len(data) == 0 and self.county_config.identifier_type == "address":
                     simplified = get_simplified_address(identifier)
                     if simplified != identifier:
                         logger.debug(f"Trying with simplified address: {simplified}")
                         return self.get_property_data(simplified)
+                
+                # Fallback 3: $q full-text search (for records with empty combined address field)
+                # Try with 0-3 leading zeros on the address number
+                if len(data) == 0 and self.county_config.identifier_type == "address":
+                    _, address_number, street_name = parse_address(identifier)
+                    if address_number:
+                        street_suffixes = {"ST", "AVE", "RD", "DR", "LN", "CT", "PL", "BLVD", "WAY", "CIR", "TER", "PKY", "HWY", "SQ", "ALY"}
+                        parts = street_name.rsplit(" ", 1)
+                        bare_street = parts[0] if len(parts) == 2 and parts[1].upper() in street_suffixes else street_name
+
+                        for zeros in range(4):  # try 0, 1, 2, 3 leading zeros
+                            padded_num = "0" * zeros + address_number
+                            q_term = f"{padded_num} {bare_street}"
+                            q_url = f"{self.county_config.base_url}?$q={urllib.parse.quote(q_term)}&$limit=10"
+                            logger.info(f"Trying $q full-text search: '{q_term}'")
+
+                            q_data = self._make_request_with_retry(q_url, f"$q search '{q_term}'")
+                            if q_data and len(q_data) > 0:
+                                data = q_data
+                                logger.info(f"$q search found {len(data)} results for '{q_term}'")
+                                break
                 
                 # For parcel_id counties - try alternative padding lengths
                 if len(data) == 0 and self.county_config.identifier_type == "parcel_id" and self.county_config.parcel_digits > 0:

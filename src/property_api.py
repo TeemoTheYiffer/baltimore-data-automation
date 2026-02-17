@@ -47,22 +47,21 @@ class PropertyDataAPI:
         import time
         import random
 
-        max_retries = 5
-        retryable_codes = {500, 403, 429}
+        max_retries = 3
+        retryable_codes = {500, 429}  # Only retry server errors and explicit rate limits
 
         for attempt in range(max_retries):
             try:
-                logger.debug(f"Attempting {description} (attempt {attempt + 1}): {url}")
-
                 response = self.session.get(url, timeout=self.config.REQUEST_TIMEOUT)
+
+                # 403: don't retry — either auth issue or data doesn't exist
+                if response.status_code == 403:
+                    logger.info(f"403 on {description} — skipping (no data or access denied)")
+                    return []
 
                 if response.status_code in retryable_codes:
                     if attempt < max_retries - 1:
-                        if response.status_code in {403, 429}:
-                            # Wide jitter so threads don't all retry at the same instant
-                            wait_time = min(90, 10 * (2 ** attempt)) + random.uniform(5.0, 20.0)
-                        else:
-                            wait_time = (2 ** attempt) + random.uniform(0.5, 2.0)
+                        wait_time = (2 ** attempt) + random.uniform(0.5, 2.0)
                         logger.warning(f"{response.status_code} error on {description}, retrying in {wait_time:.0f}s (attempt {attempt + 1}/{max_retries})")
                         time.sleep(wait_time)
                         continue
@@ -71,20 +70,15 @@ class PropertyDataAPI:
                         return None
 
                 response.raise_for_status()
-                data = response.json()
-
-                if attempt > 0:
-                    logger.info(f"Successfully retrieved {description} after {attempt + 1} attempts")
-
-                return data
+                return response.json()
 
             except requests.exceptions.HTTPError as e:
                 status_code = e.response.status_code if hasattr(e, 'response') and e.response else None
+                if status_code == 403:
+                    logger.info(f"403 on {description} — skipping")
+                    return []
                 if status_code in retryable_codes and attempt < max_retries - 1:
-                    if status_code in {403, 429}:
-                        wait_time = min(90, 10 * (2 ** attempt)) + random.uniform(5.0, 20.0)
-                    else:
-                        wait_time = (2 ** attempt) + random.uniform(0.5, 2.0)
+                    wait_time = (2 ** attempt) + random.uniform(0.5, 2.0)
                     logger.warning(f"HTTP {status_code} error on {description}, retrying in {wait_time:.0f}s")
                     time.sleep(wait_time)
                     continue
@@ -200,7 +194,18 @@ class PropertyDataAPI:
                     )
 
                 number_condition = f"({' OR '.join(conditions)})"
-                street_condition = f"premise_address_name_mdp_field_premsnam_sdat_field_23 LIKE '{urllib.parse.quote(street_name)}'"
+
+                # Try street name with AND without type suffix (ST, AVE, RD, etc.)
+                # Database may store "ABBOTSTON" instead of "ABBOTSTON ST"
+                street_suffixes = {"ST", "AVE", "RD", "DR", "LN", "CT", "PL", "BLVD", "WAY", "CIR", "TER", "PKY", "HWY", "SQ", "ALY"}
+                street_name_parts = street_name.rsplit(" ", 1)
+                street_variants = [urllib.parse.quote(street_name)]
+                if len(street_name_parts) == 2 and street_name_parts[1].upper() in street_suffixes:
+                    # Also try without the suffix
+                    street_variants.append(urllib.parse.quote(street_name_parts[0]))
+
+                street_conditions = [f"premise_address_name_mdp_field_premsnam_sdat_field_23 LIKE '{v}'" for v in street_variants]
+                street_condition = f"({' OR '.join(street_conditions)})" if len(street_conditions) > 1 else street_conditions[0]
 
                 base_query = f"{self.county_config.base_url}?$where={number_condition} AND {street_condition}"
         

@@ -17,29 +17,18 @@ class PropertyDataAPI:
         self.county_config = self.config.get_county_config(county)
         self.session = requests.Session()
 
-        # Socrata API authentication (higher rate limits)
+        # Socrata API app token (higher rate limits — no Basic auth needed for reads)
         app_token = self.config.MARYLAND_APP_TOKEN
-        app_secret = self.config.MARYLAND_APP_SECRET
 
-        if app_token and app_secret:
-            self.session.auth = (app_token, app_secret)
+        if app_token:
             self.session.headers.update({
                 'X-App-Token': app_token,
                 'Accept': 'application/json',
             })
-            logger.info("Socrata API: authenticated with app token")
-        elif app_token:
-            # Token without secret — still gets higher rate limits
-            self.session.headers.update({
-                'X-App-Token': app_token,
-                'Accept': 'application/json',
-            })
-            logger.info("Socrata API: using app token (no secret)")
+            logger.info("Socrata API: using app token for higher rate limits")
         else:
-            # Fallback: browser-like headers for unauthenticated requests
             self.session.headers.update({
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept': 'application/json, text/plain, */*',
+                'Accept': 'application/json',
             })
             logger.warning("Socrata API: no app token configured — rate limits will be strict")
         

@@ -259,28 +259,50 @@ class PropertyDataAPI:
                         return self.get_property_data(simplified)
                 
                 # Fallback 3: $q full-text search (for records with empty combined address field)
-                # $q is slow (full-text scan) — only try 0 and 1 leading zero
+                # Database stores address numbers as 5 digits (e.g. 121 → 00121, 1534 → 01534)
+                # $q is slow (full-text scan) — try padded-to-5 first, then original
                 if len(data) == 0 and self.county_config.identifier_type == "address":
                     _, address_number, street_name = parse_address(identifier)
                     if address_number:
                         street_suffixes = {"ST", "AVE", "RD", "DR", "LN", "CT", "PL", "BLVD", "WAY", "CIR", "TER", "PKY", "HWY", "SQ", "ALY"}
+                        directionals = {"N", "S", "E", "W", "NE", "NW", "SE", "SW"}
+
+                        # Strip street suffix (ST, AVE, etc.)
                         parts = street_name.rsplit(" ", 1)
                         bare_street = parts[0] if len(parts) == 2 and parts[1].upper() in street_suffixes else street_name
 
-                        for zeros in range(2):  # only 0 and 1 leading zero
-                            padded_num = "0" * zeros + address_number
-                            q_term = f"{padded_num} {bare_street}"
+                        # Strip directional prefix (N, S, E, W, etc.) to get core street name
+                        # e.g. "S ADDISON" → "ADDISON", "NW BALTIMORE" → "BALTIMORE"
+                        core_parts = bare_street.split(" ", 1)
+                        core_street = core_parts[1] if len(core_parts) == 2 and core_parts[0].upper() in directionals else bare_street
+
+                        padded_5 = address_number.zfill(5)
+                        candidates = [padded_5, address_number] if padded_5 != address_number else [address_number]
+
+                        for num in candidates:
+                            q_term = f"{num} {core_street}"
                             q_url = f"{self.county_config.base_url}?$q={urllib.parse.quote(q_term)}&$limit=5"
                             logger.info(f"Trying $q full-text search: '{q_term}'")
 
                             try:
                                 q_data = self._make_request_with_retry(q_url, f"$q search '{q_term}'", timeout=60)
                                 if q_data and len(q_data) > 0:
-                                    data = q_data
-                                    logger.info(f"$q search found {len(data)} results for '{q_term}'")
-                                    break
+                                    # Validate results: check address number and street name match
+                                    num_field = "premise_address_number_mdp_field_premsnum_sdat_field_20"
+                                    name_field = "premise_address_name_mdp_field_premsnam_sdat_field_23"
+                                    validated = [
+                                        r for r in q_data
+                                        if r.get(num_field, "").lstrip("0") == address_number.lstrip("0")
+                                        and core_street.upper() in r.get(name_field, "").upper()
+                                    ]
+                                    if validated:
+                                        data = validated
+                                        logger.info(f"$q search found {len(validated)} validated results for '{q_term}'")
+                                        break
+                                    else:
+                                        logger.info(f"$q search returned {len(q_data)} results for '{q_term}' but none matched address")
                             except Exception as q_err:
-                                logger.warning(f"$q search timed out for '{q_term}': {q_err}")
+                                logger.warning(f"$q search failed for '{q_term}': {q_err}")
                                 break  # don't try more $q if it's timing out
                 
                 # For parcel_id counties - try alternative padding lengths

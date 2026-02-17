@@ -64,7 +64,7 @@ class AppConfig(BaseSettings):
     PROCESSING_MODE: str = "property"
     SHEET_NAME: Optional[str] = "LIENS"
     DEBUG_MODE: bool = False  # For things like verbose API output, debug endpoints, etc.
-    MAX_WORKERS: int = 10  # Maximum number of threads for concurrent requests
+    MAX_WORKERS: int = 10  # Concurrent threads (Socrata app token allows higher rate limits)
     MAX_RETRIES: int = 3  # Maximum retries for failed requests
     COUNTY_CONFIGS: Dict[str, CountyConfig] = Field(default_factory=dict)
     FORCE_REPROCESS: bool = False
@@ -84,8 +84,12 @@ class AppConfig(BaseSettings):
     SERVICE_ACCOUNT_FILE: Optional[str] = None
     IMPERSONATED_USER: Optional[str] = None
 
+    # Socrata (Maryland Open Data) API credentials
+    MARYLAND_APP_TOKEN: Optional[str] = None
+    MARYLAND_APP_SECRET: Optional[str] = None
+
     # Processing settings
-    REQUEST_DELAY: float = 0.5  # Increased from 0.3 to help avoid rate limiting
+    REQUEST_DELAY: float = 0.5  # Delay per thread between API calls
     BATCH_SIZE: int = 100
 
     # Water bill settings

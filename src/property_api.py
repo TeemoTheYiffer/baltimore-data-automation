@@ -16,17 +16,32 @@ class PropertyDataAPI:
         self.config = config or AppConfig()
         self.county_config = self.config.get_county_config(county)
         self.session = requests.Session()
-        
-        # Add browser-like headers to avoid blocking
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'application/json, text/plain, */*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-        })
+
+        # Socrata API authentication (higher rate limits)
+        app_token = self.config.MARYLAND_APP_TOKEN
+        app_secret = self.config.MARYLAND_APP_SECRET
+
+        if app_token and app_secret:
+            self.session.auth = (app_token, app_secret)
+            self.session.headers.update({
+                'X-App-Token': app_token,
+                'Accept': 'application/json',
+            })
+            logger.info("Socrata API: authenticated with app token")
+        elif app_token:
+            # Token without secret — still gets higher rate limits
+            self.session.headers.update({
+                'X-App-Token': app_token,
+                'Accept': 'application/json',
+            })
+            logger.info("Socrata API: using app token (no secret)")
+        else:
+            # Fallback: browser-like headers for unauthenticated requests
+            self.session.headers.update({
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'application/json, text/plain, */*',
+            })
+            logger.warning("Socrata API: no app token configured — rate limits will be strict")
         
 
     def _make_request_with_retry(self, url: str, description: str) -> Optional[List[Dict]]:
@@ -43,8 +58,8 @@ class PropertyDataAPI:
         import time
         import random
 
-        max_retries = 5  # Increased retries for rate limiting
-        retryable_codes = {500, 403, 429}  # Server error, Forbidden (rate limit), Too Many Requests
+        max_retries = 5
+        retryable_codes = {500, 403, 429}
 
         for attempt in range(max_retries):
             try:
@@ -54,12 +69,12 @@ class PropertyDataAPI:
 
                 if response.status_code in retryable_codes:
                     if attempt < max_retries - 1:
-                        # Longer backoff for rate limiting (403/429)
                         if response.status_code in {403, 429}:
-                            wait_time = (3 ** attempt) + random.uniform(1.0, 3.0)  # Longer backoff for rate limits
+                            # Wide jitter so threads don't all retry at the same instant
+                            wait_time = min(90, 10 * (2 ** attempt)) + random.uniform(5.0, 20.0)
                         else:
-                            wait_time = (2 ** attempt) + random.uniform(0.1, 0.5)
-                        logger.warning(f"{response.status_code} error on {description}, retrying in {wait_time:.2f}s (attempt {attempt + 1}/{max_retries})")
+                            wait_time = (2 ** attempt) + random.uniform(0.5, 2.0)
+                        logger.warning(f"{response.status_code} error on {description}, retrying in {wait_time:.0f}s (attempt {attempt + 1}/{max_retries})")
                         time.sleep(wait_time)
                         continue
                     else:
@@ -78,17 +93,17 @@ class PropertyDataAPI:
                 status_code = e.response.status_code if hasattr(e, 'response') and e.response else None
                 if status_code in retryable_codes and attempt < max_retries - 1:
                     if status_code in {403, 429}:
-                        wait_time = (3 ** attempt) + random.uniform(1.0, 3.0)
+                        wait_time = min(90, 10 * (2 ** attempt)) + random.uniform(5.0, 20.0)
                     else:
-                        wait_time = (2 ** attempt) + random.uniform(0.1, 0.5)
-                    logger.warning(f"HTTP {status_code} error on {description}, retrying in {wait_time:.2f}s")
+                        wait_time = (2 ** attempt) + random.uniform(0.5, 2.0)
+                    logger.warning(f"HTTP {status_code} error on {description}, retrying in {wait_time:.0f}s")
                     time.sleep(wait_time)
                     continue
                 else:
                     logger.error(f"HTTP error on {description}: {e}")
                     if attempt == max_retries - 1:
                         return None
-                    raise  # Re-raise for non-retryable errors
+                    raise
             except Exception as e:
                 logger.error(f"Request error on {description}: {e}")
                 if attempt == max_retries - 1:

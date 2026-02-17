@@ -71,7 +71,8 @@ deploy-production:
         --memory "16Gi" \
         --concurrency "10" \
         --cpu-boost \
-        --execution-environment gen2
+        --execution-environment gen2 \
+        --set-env-vars "MARYLAND_APP_TOKEN=${MARYLAND_APP_TOKEN},MARYLAND_APP_SECRET=${MARYLAND_APP_SECRET}"
     - echo "Deployed to production"
     - gcloud run services describe "${SERVICE_NAME}" --region="${GCP_REGION}" --format="value(status.url)"
   rules:
@@ -101,7 +102,8 @@ deploy-staging:
         --memory "16Gi" \
         --concurrency "10" \
         --cpu-boost \
-        --execution-environment gen2
+        --execution-environment gen2 \
+        --set-env-vars "MARYLAND_APP_TOKEN=${MARYLAND_APP_TOKEN},MARYLAND_APP_SECRET=${MARYLAND_APP_SECRET}"
     - echo "Deployed to staging"
     - gcloud run services describe "${SERVICE_NAME}-staging" --region="${GCP_REGION}" --format="value(status.url)"
   rules:

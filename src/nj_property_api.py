@@ -168,6 +168,7 @@ NJ_FIELD_MAPPING = {
     # Computed/Status fields (populated by code)
     "Status": "",
     "VacantLot": "",
+    "GIS_Link": "",
 }
 
 # Reverse mapping for API queries
@@ -434,6 +435,14 @@ class NJPropertyAPI:
 
         # Calculate derived fields
         value_map.update(self._calculate_derived_fields(attributes))
+
+        # Build GIS map link using PAMS_PIN
+        pams_pin = attributes.get("PAMS_PIN", "")
+        if pams_pin:
+            value_map["GIS_Link"] = (
+                f"https://newjersey.maps.arcgis.com/apps/webappviewer/index.html"
+                f"?id=3a4290e1b3d64094a8b8a127965ab43a&find={urllib.parse.quote(str(pams_pin))}"
+            )
 
         # Add the original identifiers
         value_map["Block"] = block

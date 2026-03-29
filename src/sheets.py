@@ -1653,7 +1653,7 @@ class SheetsManager:
                 "YearBuilt", "Acreage", "PropertyClass", "BuildingDesc",
                 "VacantLot", "SalePrice", "DeedDate", "MailingAddress",
                 "MailingCityState", "ZipCode", "Municipality", "County",
-                "PAMS_PIN", "Status"
+                "PAMS_PIN", "GIS_Link", "Status"
             ]
 
             # Check which fields are missing from the sheet

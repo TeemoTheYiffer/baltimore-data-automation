@@ -1,4 +1,5 @@
 import logging
+import threading
 import requests
 import urllib.parse
 from typing import Dict, Any, Optional, List
@@ -32,7 +33,13 @@ class PropertyDataAPI:
             logger.info("Socrata API: using HTTP Basic Auth (API key) for authenticated rate limits")
         else:
             logger.warning("Socrata API: no API key configured — rate limits will be strict")
-        
+
+        # Learned-once parcel width: when alt-padding succeeds for the first row in a
+        # misconfigured batch, we record the winning digit count and apply it to every
+        # subsequent row's primary query so they don't each re-run the full fallback.
+        self._learned_parcel_digits: Optional[int] = None
+        self._learned_parcel_digits_lock = threading.Lock()
+
 
     def _make_request_with_retry(self, url: str, description: str, timeout: int = None) -> Optional[List[Dict]]:
         """
@@ -180,32 +187,27 @@ class PropertyDataAPI:
         return final_url
 
     def format_fallback_api_url(self, identifier: str, optional_params: Optional[Dict[str, str]] = None) -> str:
-        """Format the fallback API URL using the short field name to avoid Cloudflare WAF.
+        """Format the fallback API URL for address lookups with the street type suffix stripped.
 
-        Cloudflare blocks queries with long Socrata field names (50+ chars).
-        Fallback uses mdp_street_address_mdp_field_address (works) with the
-        street type suffix stripped, e.g. '1534 ABBOTSTON%' instead of
-        '1534 ABBOTSTON ST%'.
+        Broadens the match by searching '1534 ABBOTSTON%' instead of
+        '1534 ABBOTSTON ST%'. Address-only; parcel_id lookups skip this fallback
+        and go straight to alternative-padding attempts.
         """
-        if self.county_config.identifier_type == "parcel_id":
-            base_query = f"{self.county_config.base_url}?$where=record_key_account_number_sdat_field_3 LIKE '{urllib.parse.quote(identifier)}'"
+        _, address_number, street_name = parse_address(identifier)
+
+        if not address_number:
+            base_query = f"{self.county_config.base_url}?$where=mdp_street_address_mdp_field_address LIKE '{urllib.parse.quote(identifier)}%25'"
         else:
-            _, address_number, street_name = parse_address(identifier)
-
-            if not address_number:
-                base_query = f"{self.county_config.base_url}?$where=mdp_street_address_mdp_field_address LIKE '{urllib.parse.quote(identifier)}%25'"
+            # Strip street type suffix (ST, AVE, RD, etc.) for broader matching
+            street_suffixes = {"ST", "AVE", "RD", "DR", "LN", "CT", "PL", "BLVD", "WAY", "CIR", "TER", "PKY", "HWY", "SQ", "ALY"}
+            street_name_parts = street_name.rsplit(" ", 1)
+            if len(street_name_parts) == 2 and street_name_parts[1].upper() in street_suffixes:
+                bare_street = street_name_parts[0]
             else:
-                # Strip street type suffix (ST, AVE, RD, etc.) for broader matching
-                street_suffixes = {"ST", "AVE", "RD", "DR", "LN", "CT", "PL", "BLVD", "WAY", "CIR", "TER", "PKY", "HWY", "SQ", "ALY"}
-                street_name_parts = street_name.rsplit(" ", 1)
-                if len(street_name_parts) == 2 and street_name_parts[1].upper() in street_suffixes:
-                    bare_street = street_name_parts[0]
-                else:
-                    bare_street = street_name
+                bare_street = street_name
 
-                # Use short field name with wildcard: "1534 ABBOTSTON%"
-                fallback_address = f"{address_number} {bare_street}"
-                base_query = f"{self.county_config.base_url}?$where=mdp_street_address_mdp_field_address LIKE '{urllib.parse.quote(fallback_address)}%25'"
+            fallback_address = f"{address_number} {bare_street}"
+            base_query = f"{self.county_config.base_url}?$where=mdp_street_address_mdp_field_address LIKE '{urllib.parse.quote(fallback_address)}%25'"
         
         # Add optional parameters if provided
         optional_clause = self._build_optional_params_clause(optional_params)
@@ -219,17 +221,17 @@ class PropertyDataAPI:
         original_identifier = identifier
 
         try:
-            # For parcel_id counties, pad with leading zeros if needed
-            if (
-                self.county_config.identifier_type == "parcel_id"
-                and self.county_config.parcel_digits > 0
-            ):
-                current_length = len(identifier)
-                expected_length = self.county_config.parcel_digits
-
-                if current_length < expected_length:
-                    padding = expected_length - current_length
-                    identifier = "0" * padding + identifier
+            # For parcel_id counties, pad with leading zeros if needed.
+            # Prefer a width learned from a prior alt-padding success in this batch
+            # over the user-supplied parcel_digits, since that's the width Socrata
+            # actually matched.
+            if self.county_config.identifier_type == "parcel_id":
+                expected_length = self._learned_parcel_digits or self.county_config.parcel_digits
+                if expected_length > 0:
+                    current_length = len(identifier)
+                    if current_length < expected_length:
+                        padding = expected_length - current_length
+                        identifier = "0" * padding + identifier
 
             # Try primary API call with retry logic
             api_url = self.format_api_url(identifier, optional_params)
@@ -242,14 +244,16 @@ class PropertyDataAPI:
 
             # If no results, try fallback approaches
             if len(data) == 0:
-                # Fallback 1: same short field, street suffix stripped (e.g. "1534 ABBOTSTON%")
-                fallback_url = self.format_fallback_api_url(identifier, optional_params)
-                logger.info(f"No results with primary query for {self.county_config.identifier_type}: {identifier}. Trying fallback: {fallback_url}")
+                # Fallback 1: address-only — strip street type suffix for broader match.
+                # Skipped for parcel_id since there's no analogous broadening transformation.
+                if self.county_config.identifier_type == "address":
+                    fallback_url = self.format_fallback_api_url(identifier, optional_params)
+                    logger.info(f"No results with primary query for {self.county_config.identifier_type}: {identifier}. Trying fallback: {fallback_url}")
 
-                data = self._make_request_with_retry(fallback_url, f"fallback query for '{identifier}'")
+                    data = self._make_request_with_retry(fallback_url, f"fallback query for '{identifier}'")
 
-                if data is None:
-                    return {"success": False, "message": f"Fallback API request failed for {original_identifier}"}
+                    if data is None:
+                        return {"success": False, "message": f"Fallback API request failed for {original_identifier}"}
                 
                 # Fallback 2: simplified address
                 if len(data) == 0 and self.county_config.identifier_type == "address":
@@ -309,8 +313,9 @@ class PropertyDataAPI:
                 if len(data) == 0 and self.county_config.identifier_type == "parcel_id" and self.county_config.parcel_digits > 0:
                     original_digits = self.county_config.parcel_digits
                     
-                    # Try +1 and -1 digit variations
-                    padding_attempts = [original_digits + 1, original_digits - 1]
+                    # Try ±1 first, then -2 before +2 (shorter account widths are
+                    # more common in practice; 10-digit parcels are rarely seen).
+                    padding_attempts = [original_digits + 1, original_digits - 1, original_digits - 2, original_digits + 2]
                     
                     for attempt_digits in padding_attempts:
                         if attempt_digits <= 0:  # Skip invalid padding lengths
@@ -333,6 +338,15 @@ class PropertyDataAPI:
                         if alt_data is not None and len(alt_data) > 0:
                             logger.info(f"Success with alternative padding: {attempt_digits} digits for {original_identifier}")
                             data = alt_data
+                            with self._learned_parcel_digits_lock:
+                                if self._learned_parcel_digits is None:
+                                    self._learned_parcel_digits = attempt_digits
+                                    logger.warning(
+                                        f"Learned parcel_digits={attempt_digits} for {self.county_config.county_name} "
+                                        f"(request specified {self.county_config.parcel_digits}). "
+                                        f"Remaining rows in this batch will use {attempt_digits} digits on primary query. "
+                                        f"Update your batch request's parcel_digits to avoid the discovery overhead."
+                                    )
                             break
                     
                     # If alternative padding found results, update the identifier for processing

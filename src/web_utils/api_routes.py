@@ -92,19 +92,35 @@ async def process_property_data(
         )
 
         # Process the single county
-        await asyncio.to_thread(
+        results_data = await asyncio.to_thread(
             process_county_property_data,
             county_name=county,
             config=config,
             sheets_manager=sheets_manager,
             sheet_name=property_sheet_name,
             cache_manager=cache_manager,
+            job_id=job_id,
+            job_store=job_store,
         )
+
+        stats = (results_data or {}).get("stats", {}) if isinstance(results_data, dict) else {}
+        completion_message = f"Completed {county} county property data: {stats.get('success', 0)} successful, {stats.get('error', 0)} failed"
+
+        learned = stats.get("learned_parcel_digits")
+        if learned is not None:
+            requested = stats.get("requested_parcel_digits")
+            completion_message += (
+                f". NOTE: parcel_digits auto-corrected from {requested} to {learned} mid-batch — "
+                f"update your request to parcel_digits={learned} to avoid discovery overhead on future runs."
+            )
 
         job_store.update_job_progress(
             job_id=job_id,
             progress=80,
-            message=f"Completed {county} county property data",
+            message=completion_message,
+            success_count=stats.get("success", 0),
+            error_count=stats.get("error", 0),
+            total_processed=stats.get("total", 0),
         )
     except Exception as e:
         logger.exception(f"Error processing property data: {e}")

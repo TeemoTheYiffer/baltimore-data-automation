@@ -444,7 +444,7 @@ def process_county_property_data(
         logger.warning(
             f"No {county_config.identifier_type} found in sheet: {sheet_name}"
         )
-        return
+        return {"results": [], "stats": {"total": 0, "success": 0, "error": 0}}
     
     stats["total"] = len(identifier_data)
     logger.info(f"Processing with MAX_ROWS={config.MAX_ROWS}")
@@ -780,6 +780,11 @@ def process_county_property_data(
             progress=95,
             message=f"Completed {county_name} property processing: {stats['success']} successful, {stats['error']} failed"
         )
+
+    # Surface any parcel width learned mid-batch so the API caller can update their request
+    if property_api._learned_parcel_digits is not None:
+        stats["learned_parcel_digits"] = property_api._learned_parcel_digits
+        stats["requested_parcel_digits"] = county_config.parcel_digits
 
     return {
         "results": results,

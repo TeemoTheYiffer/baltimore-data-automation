@@ -101,11 +101,18 @@ class JobStore:
                         else f"Job is {status}. Progress: {progress}%"
                     )
 
+                    errors_bytes = self.redis.hget(key, "errors")
+                    errors = errors_bytes.decode("utf-8").split(",") if errors_bytes else []
+
                     return {
                         "job_id": job_id,
                         "progress": progress,
                         "status": status,
                         "message": message,
+                        "errors": errors,
+                        "error_count": int(self.redis.hget(key, "error_count") or 0),
+                        "success_count": int(self.redis.hget(key, "success_count") or 0),
+                        "total_processed": int(self.redis.hget(key, "total_processed") or 0),
                     }
                 except Exception as e:
                     logger.error(f"Error reading from Redis: {e}")
@@ -126,6 +133,10 @@ class JobStore:
                     "progress": progress,
                     "status": status,
                     "message": message,
+                    "errors": job_data.get("errors", []),
+                    "error_count": job_data.get("error_count", 0),
+                    "success_count": job_data.get("success_count", 0),
+                    "total_processed": job_data.get("total_processed", 0),
                 }
         except Exception as e:
             logger.exception(f"Unexpected error in get_job_status: {e}")

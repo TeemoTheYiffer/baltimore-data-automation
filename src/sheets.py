@@ -1288,13 +1288,6 @@ class SheetsManager:
                         logger.info(f"Protecting identifier column '{county_config.identifier_column}' (index {identifier_col_index}) from being overwritten")
                 except Exception as e:
                     logger.warning(f"Could not determine protected columns: {e}")
-            
-            # Also protect common identifier columns as fallback
-            for common_identifier in ["parcelid", "address"]:
-                col_index = header_map.get(common_identifier, -1)
-                if col_index >= 0:
-                    protected_columns.add(col_index)
-                    logger.debug(f"Protecting common identifier column '{common_identifier}' (index {col_index})")
 
             # PHASE 1: Collect all data into organized structure
             row_data_matrix = {}  # row_index -> {col_index: value}

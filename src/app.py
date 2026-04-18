@@ -443,12 +443,13 @@ async def run_batch_processing_job(
             # Process property data
             await process_property_data(job_id, config, sheets_manager, cache_manager, job_store)
 
-        # Mark as complete
+        # Mark as complete. Preserve the detailed message set by the inner processors
+        # (which includes stats and any learned-config hints) by passing message=None.
         job_store.update_job_progress(
             job_id=job_id,
             progress=100,
             status="completed",
-            message="Batch processing completed successfully",
+            message=None,
         )
 
     except Exception as e:

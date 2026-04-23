@@ -16,12 +16,20 @@ class CountyEnum(str, Enum):
     BALTIMORE_CITY = "baltimore_city"
     PG = "pg"
     FREDERICK = "frederick"
-    MONTGOMERY = "montgomery"  
-    ALLEGANY = "allegany"      
-    HARFORD = "harford"        
+    MONTGOMERY = "montgomery"
+    ALLEGANY = "allegany"
+    HARFORD = "harford"
     DORCHESTER = "dorchester"
-    ANNE_ARUNDEL = "anne_arundel"  
-    HOWARD = "howard"              
+    ANNE_ARUNDEL = "anne_arundel"
+    HOWARD = "howard"
+    CHARLES = "charles"
+    WORCESTER = "worcester"
+    QUEEN_ANNES = "queen_annes"
+    CECIL = "cecil"
+    CAROLINE = "caroline"
+    CARROLL = "carroll"
+    GARRETT = "garrett"
+    TALBOT = "talbot"
 
     @classmethod
     def get_all(cls) -> List[str]:
@@ -112,6 +120,14 @@ class AppConfig(BaseSettings):
     DORCHESTER_URL: str = "https://opendata.maryland.gov/resource/ye3m-tr66.json"
     ANNE_ARUNDEL_URL: str = "https://opendata.maryland.gov/resource/3w75-7rie.json"
     HOWARD_URL: str = "https://opendata.maryland.gov/resource/9t52-zebk.json"
+    CHARLES_URL: str = "https://opendata.maryland.gov/resource/bjbs-4wm4.json"
+    WORCESTER_URL: str = "https://opendata.maryland.gov/resource/egig-zwf2.json"
+    QUEEN_ANNES_URL: str = "https://opendata.maryland.gov/resource/pjxc-6ue9.json"
+    CECIL_URL: str = "https://opendata.maryland.gov/resource/38hv-8vsw.json"
+    CAROLINE_URL: str = "https://opendata.maryland.gov/resource/n7e6-xr7y.json"
+    CARROLL_URL: str = "https://opendata.maryland.gov/resource/h6dw-jc8j.json"
+    GARRETT_URL: str = "https://opendata.maryland.gov/resource/mqbe-3jwy.json"
+    TALBOT_URL: str = "https://opendata.maryland.gov/resource/2jmf-hy9w.json"
 
     RETRY_FAILED_ROWS: bool = True
     DELAY_BETWEEN_BATCHES: float = 2.0
@@ -129,6 +145,9 @@ class AppConfig(BaseSettings):
         "lat": "mdp_latitude_mdp_field_digycord_converted_to_wgs84",
         "long": "mdp_longitude_mdp_field_digxcord_converted_to_wgs84",
         "above_ground_living_area": "c_a_m_a_system_data_structure_area_sq_ft_mdp_field_sqftstrc_sdat_field_241",
+        "Year_Built": "c_a_m_a_system_data_year_built_yyyy_mdp_field_yearblt_sdat_field_235",
+        "Assesed_Value": "current_assessment_year_total_assessment_sdat_field_172",
+        "Assessed_Value": "current_assessment_year_total_assessment_sdat_field_172",
         "BLOCK": "block_mdp_field_block_sdat_field_40",
         "LOT": "lot_mdp_field_lot_sdat_field_41",
         "sales_price": "sales_segment_1_consideration_mdp_field_considr1_sdat_field_90",
@@ -244,6 +263,70 @@ class AppConfig(BaseSettings):
                 field_mapping=self.FIELD_MAPPING,
                 spreadsheet_id=None,
             ),
+            "charles": CountyConfig(
+                county_name="charles",
+                base_url=self.CHARLES_URL,
+                identifier_type="parcel_id",
+                identifier_column="ParcelID",
+                field_mapping=self.FIELD_MAPPING,
+                spreadsheet_id=None,
+            ),
+            "worcester": CountyConfig(
+                county_name="worcester",
+                base_url=self.WORCESTER_URL,
+                identifier_type="parcel_id",
+                identifier_column="ParcelID",
+                field_mapping=self.FIELD_MAPPING,
+                spreadsheet_id=None,
+            ),
+            "queen_annes": CountyConfig(
+                county_name="queen_annes",
+                base_url=self.QUEEN_ANNES_URL,
+                identifier_type="parcel_id",
+                identifier_column="ParcelID",
+                field_mapping=self.FIELD_MAPPING,
+                spreadsheet_id=None,
+            ),
+            "cecil": CountyConfig(
+                county_name="cecil",
+                base_url=self.CECIL_URL,
+                identifier_type="parcel_id",
+                identifier_column="ParcelID",
+                field_mapping=self.FIELD_MAPPING,
+                spreadsheet_id=None,
+            ),
+            "caroline": CountyConfig(
+                county_name="caroline",
+                base_url=self.CAROLINE_URL,
+                identifier_type="parcel_id",
+                identifier_column="ParcelID",
+                field_mapping=self.FIELD_MAPPING,
+                spreadsheet_id=None,
+            ),
+            "carroll": CountyConfig(
+                county_name="carroll",
+                base_url=self.CARROLL_URL,
+                identifier_type="parcel_id",
+                identifier_column="ParcelID",
+                field_mapping=self.FIELD_MAPPING,
+                spreadsheet_id=None,
+            ),
+            "garrett": CountyConfig(
+                county_name="garrett",
+                base_url=self.GARRETT_URL,
+                identifier_type="parcel_id",
+                identifier_column="ParcelID",
+                field_mapping=self.FIELD_MAPPING,
+                spreadsheet_id=None,
+            ),
+            "talbot": CountyConfig(
+                county_name="talbot",
+                base_url=self.TALBOT_URL,
+                identifier_type="parcel_id",
+                identifier_column="ParcelID",
+                field_mapping=self.FIELD_MAPPING,
+                spreadsheet_id=None,
+            ),
         }
     
     @classmethod  
@@ -316,6 +399,8 @@ class AppConfig(BaseSettings):
             county_name = "baltimore_city"
         elif county_name in ["baltimore_county", "baltimore county"]:
             county_name = "baltimore"
+        elif county_name in ["queen anne's", "queen annes", "queen_anne's", "queen anne", "queens"]:
+            county_name = "queen_annes"
 
         if county_name not in self.COUNTY_CONFIGS:
             valid_counties = list(self.COUNTY_CONFIGS.keys())

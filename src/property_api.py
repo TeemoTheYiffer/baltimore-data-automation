@@ -310,12 +310,16 @@ class PropertyDataAPI:
                                 break  # don't try more $q if it's timing out
                 
                 # For parcel_id counties - try alternative padding lengths
-                if len(data) == 0 and self.county_config.identifier_type == "parcel_id" and self.county_config.parcel_digits > 0:
+                if len(data) == 0 and self.county_config.identifier_type == "parcel_id":
                     original_digits = self.county_config.parcel_digits
-                    
-                    # Try ±1 first, then -2 before +2 (shorter account widths are
-                    # more common in practice; 10-digit parcels are rarely seen).
-                    padding_attempts = [original_digits + 1, original_digits - 1, original_digits - 2, original_digits + 2]
+
+                    if original_digits > 0:
+                        # User supplied a guess — probe around it. Try ±1 first, then -2 before +2
+                        # (shorter account widths are more common in practice).
+                        padding_attempts = [original_digits + 1, original_digits - 1, original_digits - 2, original_digits + 2]
+                    else:
+                        # User omitted parcel_digits (or passed 0) — probe common Maryland SDAT widths.
+                        padding_attempts = [8, 6, 7, 9, 10]
                     
                     for attempt_digits in padding_attempts:
                         if attempt_digits <= 0:  # Skip invalid padding lengths
@@ -391,6 +395,8 @@ class PropertyDataAPI:
                 elif field.lower() in ["sale1", "sale2", "sale3", "sales_price"]:
                     value = int(value) if value else 0
                 elif field.lower() == "above_ground_living_area":
+                    value = int(value) if value else 0
+                elif field.lower() in ["year_built", "assesed_value", "assessed_value"]:
                     value = int(value) if value else 0
                 elif field.lower() == "land_size":
                     value = float(value) if value else 0

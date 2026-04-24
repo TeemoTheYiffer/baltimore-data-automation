@@ -110,8 +110,8 @@ async def process_property_data(
         if learned is not None:
             requested = stats.get("requested_parcel_digits")
             completion_message += (
-                f". NOTE: parcel_digits auto-corrected from {requested} to {learned} mid-batch — "
-                f"update your request to parcel_digits={learned} to avoid discovery overhead on future runs."
+                f". NOTE: parcel_digits auto-corrected from {requested} to {learned} mid-batch. "
+                f"Update your request to parcel_digits={learned} to avoid discovery overhead on future runs."
             )
 
         job_store.update_job_progress(

@@ -222,6 +222,24 @@ class SheetsManager:
             if status_col_index == -1:
                 raise ValueError("Status column not found in headers")
 
+            # For parcel_id counties, auto-add District as an optional param if the sheet
+            # has a District column. Account numbers are not unique across districts in
+            # Maryland SDAT, so District is critical to disambiguate. If the District
+            # column is absent, we still run but check for ambiguity per-row downstream.
+            if county_config.identifier_type == "parcel_id":
+                already_has_district = any(
+                    v.lower() == "district" for v in county_config.optional_params.values()
+                )
+                if not already_has_district and header_map.get("district", -1) >= 0:
+                    county_config.optional_params["District"] = "District"
+                    logger.info(f"Auto-added District filter for {county_config.county_name} (District column found in sheet)")
+                elif not already_has_district:
+                    logger.warning(
+                        f"No District column found in sheet for {county_config.county_name}. "
+                        f"Parcel queries without District may return multiple matches. "
+                        f"Ambiguous rows will be flagged in the Status column."
+                    )
+
             # Find optional parameter columns if specified
             optional_param_columns = {}  # Maps column_name -> column_index
             optional_param_mapping = {}  # Maps column_name -> field_mapping_key
@@ -231,7 +249,7 @@ class SheetsManager:
                     col_index = header_map.get(column_name.lower(), -1)
                     if col_index == -1:
                         raise ValueError(f"Optional parameter column '{column_name}' not found in headers")
-                    
+
                     optional_param_columns[column_name] = col_index
                     optional_param_mapping[column_name] = field_mapping_key
                     logger.info(f"Found optional parameter column '{column_name}' -> '{field_mapping_key}' at index {col_index}")

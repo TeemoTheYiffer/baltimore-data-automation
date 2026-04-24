@@ -363,10 +363,13 @@ class AppConfig(BaseSettings):
 
         # Handle optional_params from request
         if hasattr(request, 'optional_params') and request.optional_params:
-            county_config.optional_params = request.optional_params
+            county_config.optional_params = dict(request.optional_params)
             logger.info(f"Set optional_params for {request.county}: {request.optional_params}")
         else:
             county_config.optional_params = {}
+
+        # Note: for parcel_id counties, District is auto-added at sheet-read time
+        # if the sheet has a District column. See sheets.py::get_property_identifiers.
 
         # Set parameters from request
         job_config.SHEET_NAME = getattr(request, 'sheet_name', 'LIENS')

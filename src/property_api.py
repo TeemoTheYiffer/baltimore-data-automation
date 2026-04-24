@@ -32,7 +32,7 @@ class PropertyDataAPI:
             self.session.auth = (api_key_id, api_key_secret)
             logger.info("Socrata API: using HTTP Basic Auth (API key) for authenticated rate limits")
         else:
-            logger.warning("Socrata API: no API key configured — rate limits will be strict")
+            logger.warning("Socrata API: no API key configured. Rate limits will be strict.")
 
         # Learned-once parcel width: when alt-padding succeeds for the first row in a
         # misconfigured batch, we record the winning digit count and apply it to every
@@ -64,16 +64,16 @@ class PropertyDataAPI:
             try:
                 response = self.session.get(url, timeout=timeout or self.config.REQUEST_TIMEOUT)
 
-                # 403: likely Socrata rate limiting — allow ONE retry with short delay
+                # 403: likely Socrata rate limiting. Allow ONE retry with short delay.
                 if response.status_code == 403:
                     body_preview = response.text[:200] if response.text else "(empty)"
                     if num_403_retries < max_403_retries:
                         num_403_retries += 1
                         wait_time = 3 + random.uniform(1.0, 3.0)
-                        logger.warning(f"403 on {description} — retrying once in {wait_time:.1f}s (body: {body_preview})")
+                        logger.warning(f"403 on {description}. Retrying once in {wait_time:.1f}s (body: {body_preview})")
                         time.sleep(wait_time)
                         continue
-                    logger.info(f"403 persisted on {description} — skipping (body: {body_preview})")
+                    logger.info(f"403 persisted on {description}. Skipping (body: {body_preview})")
                     return []
 
                 if response.status_code in retryable_codes:
@@ -96,10 +96,10 @@ class PropertyDataAPI:
                     if num_403_retries < max_403_retries:
                         num_403_retries += 1
                         wait_time = 3 + random.uniform(1.0, 3.0)
-                        logger.warning(f"403 on {description} — retrying once in {wait_time:.1f}s (body: {body_preview})")
+                        logger.warning(f"403 on {description}. Retrying once in {wait_time:.1f}s (body: {body_preview})")
                         time.sleep(wait_time)
                         continue
-                    logger.info(f"403 persisted on {description} — skipping (body: {body_preview})")
+                    logger.info(f"403 persisted on {description}. Skipping (body: {body_preview})")
                     return []
                 if status_code in retryable_codes and attempt < max_retries - 1:
                     wait_time = (2 ** attempt) + random.uniform(0.5, 2.0)
@@ -244,7 +244,7 @@ class PropertyDataAPI:
 
             # If no results, try fallback approaches
             if len(data) == 0:
-                # Fallback 1: address-only — strip street type suffix for broader match.
+                # Fallback 1: address-only. Strip street type suffix for broader match.
                 # Skipped for parcel_id since there's no analogous broadening transformation.
                 if self.county_config.identifier_type == "address":
                     fallback_url = self.format_fallback_api_url(identifier, optional_params)
@@ -264,7 +264,7 @@ class PropertyDataAPI:
                 
                 # Fallback 3: $q full-text search (for records with empty combined address field)
                 # Database stores address numbers as 5 digits (e.g. 121 → 00121, 1534 → 01534)
-                # $q is slow (full-text scan) — try padded-to-5 first, then original
+                # $q is slow (full-text scan). Try padded-to-5 first, then original.
                 if len(data) == 0 and self.county_config.identifier_type == "address":
                     _, address_number, street_name = parse_address(identifier)
                     if address_number:
@@ -314,11 +314,11 @@ class PropertyDataAPI:
                     original_digits = self.county_config.parcel_digits
 
                     if original_digits > 0:
-                        # User supplied a guess — probe around it. Try ±1 first, then -2 before +2
+                        # User supplied a guess. Probe around it: ±1 first, then -2 before +2
                         # (shorter account widths are more common in practice).
                         padding_attempts = [original_digits + 1, original_digits - 1, original_digits - 2, original_digits + 2]
                     else:
-                        # User omitted parcel_digits (or passed 0) — probe common Maryland SDAT widths.
+                        # User omitted parcel_digits (or passed 0). Probe common Maryland SDAT widths.
                         padding_attempts = [8, 6, 7, 9, 10]
                     
                     for attempt_digits in padding_attempts:
@@ -366,6 +366,25 @@ class PropertyDataAPI:
                     "success": False,
                     "message": f"No data found for {self.county_config.identifier_type}: {original_identifier}",
                 }
+
+            # Ambiguity guard: account numbers are not unique across districts in Maryland SDAT.
+            # If we queried by parcel_id WITHOUT a District filter and got multiple matches, we
+            # can't know which one is correct. Flag the row for the caller to resolve.
+            if self.county_config.identifier_type == "parcel_id" and len(data) > 1:
+                district_was_filtered = optional_params and any(
+                    v.lower() == "district" for v in optional_params.values()
+                )
+                if not district_was_filtered:
+                    districts = sorted({
+                        str(r.get("record_key_district_ward_sdat_field_2", "?"))
+                        for r in data
+                    })
+                    msg = (
+                        f"Ambiguous: {len(data)} properties match ParcelID {original_identifier} "
+                        f"across districts {districts}. Add a District column to the sheet to disambiguate."
+                    )
+                    logger.warning(msg)
+                    return {"success": False, "message": msg}
 
             # Process the API response
             return self._process_api_response(data[0], original_identifier)

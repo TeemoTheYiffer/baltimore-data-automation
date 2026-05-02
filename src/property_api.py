@@ -496,13 +496,15 @@ class PropertyDataAPI:
         else:
             derived_values["SDAT"] = ""
 
-        # Calculate Parcel - URL for parcel finder online
-        if (
-            "finder_online_link" in api_data
-            and isinstance(api_data["finder_online_link"], dict)
-            and "url" in api_data["finder_online_link"]
-        ):
-            derived_values["Parcel"] = api_data["finder_online_link"]["url"]
+        # Calculate Parcel - Google Maps link with a pin on the property.
+        # The SDAT-provided finder_online_link points to the retired
+        # apps.planning.maryland.gov/finderonline app, so we build a Google Maps
+        # URL from the WGS84 coordinates SDAT already returns. The ?q=lat,lon
+        # form (vs. @lat,lon,zoom) drops a pin and centers the view.
+        lat = api_data.get("mdp_latitude_mdp_field_digycord_converted_to_wgs84", "")
+        lon = api_data.get("mdp_longitude_mdp_field_digxcord_converted_to_wgs84", "")
+        if lat and lon:
+            derived_values["Parcel"] = f"https://www.google.com/maps?q={lat},{lon}"
         else:
             derived_values["Parcel"] = ""
 

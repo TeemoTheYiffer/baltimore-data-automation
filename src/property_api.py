@@ -496,15 +496,18 @@ class PropertyDataAPI:
         else:
             derived_values["SDAT"] = ""
 
-        # Calculate Parcel - Google Maps link with a pin on the property.
+        # Calculate Parcel - ArcGIS Online web map viewer link with a pin on the property.
         # The SDAT-provided finder_online_link points to the retired
-        # apps.planning.maryland.gov/finderonline app, so we build a Google Maps
-        # URL from the WGS84 coordinates SDAT already returns. The ?q=lat,lon
-        # form (vs. @lat,lon,zoom) drops a pin and centers the view.
+        # apps.planning.maryland.gov/finderonline app, which now just shows a
+        # "moved" notice. We construct an ArcGIS Online web map viewer URL from
+        # the WGS84 coordinates SDAT already returns.
         lat = api_data.get("mdp_latitude_mdp_field_digycord_converted_to_wgs84", "")
         lon = api_data.get("mdp_longitude_mdp_field_digxcord_converted_to_wgs84", "")
         if lat and lon:
-            derived_values["Parcel"] = f"https://www.google.com/maps?q={lat},{lon}"
+            derived_values["Parcel"] = (
+                f"https://www.arcgis.com/home/webmap/viewer.html"
+                f"?center={lon},{lat}&level=19&marker={lon},{lat},4326"
+            )
         else:
             derived_values["Parcel"] = ""
 

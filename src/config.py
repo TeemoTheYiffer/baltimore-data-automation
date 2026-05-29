@@ -139,6 +139,7 @@ class AppConfig(BaseSettings):
         "ADDRESS": "mdp_street_address_mdp_field_address",
         "ADDRESS_FALLBACK_NAME1": "premise_address_name_mdp_field_premsnam_sdat_field_23",  
         "ADDRESS_FALLBACK_NAME2": "premise_address_type_mdp_field_premstyp_sdat_field_24",
+        "City": "mdp_street_address_city_mdp_field_city",
         "zip": "premise_address_zip_code_mdp_field_premzip_sdat_field_26",
         "address_number": "premise_address_number_mdp_field_premsnum_sdat_field_20",
         "street_name": "premise_address_name_mdp_field_premsnam_sdat_field_23",

@@ -92,7 +92,12 @@ class AppConfig(BaseSettings):
     SERVICE_ACCOUNT_FILE: Optional[str] = None
     IMPERSONATED_USER: Optional[str] = None
 
-    # Socrata (Maryland Open Data) API Key credentials (HTTP Basic Auth)
+    # Socrata (Maryland Open Data) credentials.
+    # App token (X-App-Token header) is what raises the rate-limit ceiling above
+    # the shared anonymous-by-IP throttling pool. The API key (ID + secret, HTTP
+    # Basic Auth) authenticates the request. Send BOTH: token for throttling,
+    # key for auth.
+    MARYLAND_APP_TOKEN: Optional[str] = None
     MARYLAND_APP_API_KEY_ID: Optional[str] = None
     MARYLAND_APP_API_KEY_SECRET: Optional[str] = None
 

@@ -18,7 +18,10 @@ class PropertyDataAPI:
         self.county_config = self.config.get_county_config(county)
         self.session = requests.Session()
 
-        # Socrata API Key authentication (HTTP Basic Auth)
+        # Socrata credentials. The app token (X-App-Token) is what lifts the
+        # rate-limit ceiling above the anonymous-by-IP throttling pool; the API
+        # key (Basic Auth) authenticates. Send both when available.
+        app_token = self.config.MARYLAND_APP_TOKEN
         api_key_id = self.config.MARYLAND_APP_API_KEY_ID
         api_key_secret = self.config.MARYLAND_APP_API_KEY_SECRET
 
@@ -28,11 +31,17 @@ class PropertyDataAPI:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         })
 
+        if app_token:
+            self.session.headers['X-App-Token'] = app_token
+            logger.info("Socrata API: using app token for higher rate limits")
+        else:
+            logger.warning("Socrata API: no app token configured. Batch requests will be throttled by IP.")
+
         if api_key_id and api_key_secret:
             self.session.auth = (api_key_id, api_key_secret)
-            logger.info("Socrata API: using HTTP Basic Auth (API key) for authenticated rate limits")
-        else:
-            logger.warning("Socrata API: no API key configured. Rate limits will be strict.")
+            logger.info("Socrata API: using HTTP Basic Auth (API key) for authentication")
+        elif not app_token:
+            logger.warning("Socrata API: no credentials configured. Rate limits will be strict.")
 
         # Learned-once parcel width: when alt-padding succeeds for the first row in a
         # misconfigured batch, we record the winning digit count and apply it to every
@@ -55,62 +64,60 @@ class PropertyDataAPI:
         import time
         import random
 
-        max_retries = 3
-        retryable_codes = {500, 429}  # Only retry server errors and explicit rate limits
-        max_403_retries = 1  # Single retry for 403 (likely rate limit)
-        num_403_retries = 0
+        max_retries = 4
+        # Rate-limit codes get aggressive exponential backoff. Server errors get
+        # a gentler backoff. Everything here is retried; exhausting retries returns
+        # None (a failure), NEVER [] (which would be misread as "no results found"
+        # and trigger the expensive fallback chain on a row that actually exists).
+        rate_limit_codes = {403, 429}
+        server_error_codes = {500, 502, 503, 504}
+
+        def backoff_wait(status_code: int, attempt: int) -> float:
+            if status_code in rate_limit_codes:
+                # Socrata throttling. Wide range + jitter so concurrent threads
+                # don't all retry on the same beat and re-trigger the limit.
+                return min(60, 5 * (2 ** attempt)) + random.uniform(1.0, 5.0)
+            return (2 ** attempt) + random.uniform(0.5, 2.0)
 
         for attempt in range(max_retries):
             try:
                 response = self.session.get(url, timeout=timeout or self.config.REQUEST_TIMEOUT)
+                status_code = response.status_code
 
-                # 403: likely Socrata rate limiting. Allow ONE retry with short delay.
-                if response.status_code == 403:
+                if status_code in rate_limit_codes or status_code in server_error_codes:
                     body_preview = response.text[:200] if response.text else "(empty)"
-                    if num_403_retries < max_403_retries:
-                        num_403_retries += 1
-                        wait_time = 3 + random.uniform(1.0, 3.0)
-                        logger.warning(f"403 on {description}. Retrying once in {wait_time:.1f}s (body: {body_preview})")
-                        time.sleep(wait_time)
-                        continue
-                    logger.info(f"403 persisted on {description}. Skipping (body: {body_preview})")
-                    return []
-
-                if response.status_code in retryable_codes:
                     if attempt < max_retries - 1:
-                        wait_time = (2 ** attempt) + random.uniform(0.5, 2.0)
-                        logger.warning(f"{response.status_code} error on {description}, retrying in {wait_time:.0f}s (attempt {attempt + 1}/{max_retries})")
+                        wait_time = backoff_wait(status_code, attempt)
+                        logger.warning(
+                            f"{status_code} on {description}, retrying in {wait_time:.1f}s "
+                            f"(attempt {attempt + 1}/{max_retries}, body: {body_preview})"
+                        )
                         time.sleep(wait_time)
                         continue
-                    else:
-                        logger.error(f"{response.status_code} error persists on {description} after {max_retries} attempts")
-                        return None
+                    # Persistent rate limit / server error is a FAILURE, not "no data".
+                    logger.error(
+                        f"{status_code} persists on {description} after {max_retries} attempts "
+                        f"(body: {body_preview}). Treating as request failure."
+                    )
+                    return None
 
                 response.raise_for_status()
                 return response.json()
 
             except requests.exceptions.HTTPError as e:
                 status_code = e.response.status_code if hasattr(e, 'response') and e.response else None
-                if status_code == 403:
-                    body_preview = e.response.text[:200] if e.response and e.response.text else "(empty)"
-                    if num_403_retries < max_403_retries:
-                        num_403_retries += 1
-                        wait_time = 3 + random.uniform(1.0, 3.0)
-                        logger.warning(f"403 on {description}. Retrying once in {wait_time:.1f}s (body: {body_preview})")
+                if status_code in rate_limit_codes or status_code in server_error_codes:
+                    if attempt < max_retries - 1:
+                        wait_time = backoff_wait(status_code, attempt)
+                        logger.warning(f"HTTP {status_code} on {description}, retrying in {wait_time:.1f}s")
                         time.sleep(wait_time)
                         continue
-                    logger.info(f"403 persisted on {description}. Skipping (body: {body_preview})")
-                    return []
-                if status_code in retryable_codes and attempt < max_retries - 1:
-                    wait_time = (2 ** attempt) + random.uniform(0.5, 2.0)
-                    logger.warning(f"HTTP {status_code} error on {description}, retrying in {wait_time:.0f}s")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    logger.error(f"HTTP error on {description}: {e}")
-                    if attempt == max_retries - 1:
-                        return None
-                    raise
+                    logger.error(f"HTTP {status_code} persists on {description} after {max_retries} attempts.")
+                    return None
+                logger.error(f"HTTP error on {description}: {e}")
+                if attempt == max_retries - 1:
+                    return None
+                raise
             except Exception as e:
                 logger.error(f"Request error on {description}: {e}")
                 if attempt == max_retries - 1:

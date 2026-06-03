@@ -573,8 +573,12 @@ def process_county_property_data(
                 else:
                     stats["error"] += 1
 
-            # Cache the result
-            if cache_manager and result:
+            # Cache the result. Only cache SUCCESSES. Caching failures (e.g. a
+            # rate-limited 403 misread as "no data") poisons the cache: the file
+            # backend has no TTL and failed rows are never evicted on flush, so a
+            # single throttled run would make those addresses return stale
+            # "No data found" on every subsequent run.
+            if cache_manager and result and result.get("success"):
                 cache_data = {"row_index": row_idx, "data": result}
                 cache_manager.save_to_cache(identifier, cache_data, cache_key)
 
@@ -598,10 +602,8 @@ def process_county_property_data(
                 "data": {"Status": f"Error: {str(e)}"},
             }
 
-            # Cache the error result
-            if cache_manager:
-                cache_data = {"row_index": row_idx, "data": error_result}
-                cache_manager.save_to_cache(identifier, cache_data, cache_key)
+            # Do NOT cache errors. The row should be retried fresh on the next run
+            # rather than returning a stale cached failure.
 
             return row_idx, error_result
 
